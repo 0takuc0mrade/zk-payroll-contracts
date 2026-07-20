@@ -210,6 +210,12 @@ This project leverages Stellar's Protocol X-Ray (Protocol 25) primitives:
 - [ ] Batch payment optimization
 - [ ] Multi-currency support
 
+## SDK Contract Interface
+
+See [docs/sdk-contract-interface.md](docs/sdk-contract-interface.md) for a
+flow-oriented guide covering company setup, employee onboarding, payroll
+execution, and audit access — with sample payloads and input/output tables.
+
 ## Events
 
 See [docs/events.md](docs/events.md) for the full event schema reference and
