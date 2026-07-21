@@ -102,9 +102,9 @@ This checklist **must be completed** before any mainnet-style deployment of ZK P
   - *Test:* `test_commitment_overwrite_rejected` in `salary_commitment/src/tests.rs`
   - *Expected:* Second `set_commitment()` call for same employee returns error.
 
-- [ ] **Company registration is idempotent** — Registering the same company twice does not break state.
-  - *Test:* `test_register_company_twice()` in `payroll_registry/src/tests.rs`
-  - *Expected:* Second registration either returns same company ID or an error, never corrupt state.
+- [x] **Company registration duplicate check** — Registering duplicate companies for the same admin is rejected.
+  - *Test:* `test_register_company_duplicate_registration_fails()` & `test_register_company_duplicate_registration_panics()` in `payroll_registry/src/tests.rs`
+  - *Expected:* Second registration with the same admin address returns an error / panics.
 
 - [ ] **Nullifier mapping is consistent** — Each proof's nullifier maps to exactly one verified payment.
   - *Check:* Review `payment_executor::process_payment()` nullifier insertion logic.

@@ -502,9 +502,7 @@ impl Payroll {
 
     /// Get a pending payroll run, if it exists.
     pub fn get_pending_run(e: Env, run_id: u64) -> Option<PendingPayrollRun> {
-        e.storage()
-            .persistent()
-            .get(&DataKey::PendingRun(run_id))
+        e.storage().persistent().get(&DataKey::PendingRun(run_id))
     }
 
     /// Cancel a pending payroll run without executing any payments.
@@ -802,6 +800,81 @@ impl Payroll {
         (run_id, status),
     );
 }
+        let addrs: ContractAddresses = e
+            .storage()
+            .persistent()
+            .get(&DataKey::Addresses)
+            .expect("Not initialized");
+        if admin != addrs.admin {
+            panic!("Unauthorized");
+        }
+        admin.require_auth();
+
+        let mut draft: PayrollRunDraft = e
+            .storage()
+            .persistent()
+            .get(&DataKey::RunDraft(draft_id))
+            .expect("Draft not found");
+
+        if draft.state != RunDraftState::Pending {
+            panic!("Only pending drafts can be amended");
+        }
+        if new_total_amount <= 0 {
+            panic!("total_amount must be positive");
+        }
+
+        draft.total_amount = new_total_amount;
+        draft.employee_count = new_employee_count;
+        draft.amendment_count += 1;
+
+        e.storage()
+            .persistent()
+            .set(&DataKey::RunDraft(draft_id), &draft);
+
+        e.events().publish(
+            (symbol_short!("payroll"), Symbol::new(&e, "draft_amended")),
+            (draft_id, new_total_amount, draft.amendment_count),
+        );
+    }
+
+    /// Update the reconciliation status of a completed payroll run.
+    ///
+    /// Only the `admin` may update the reconciliation status.
+    /// Emits a `reconciliation_updated` event.
+    pub fn update_reconciliation_status(
+        e: Env,
+        admin: Address,
+        run_id: u64,
+        status: ReconciliationStatus,
+    ) {
+        let addrs: ContractAddresses = e
+            .storage()
+            .persistent()
+            .get(&DataKey::Addresses)
+            .expect("Not initialized");
+        if admin != addrs.admin {
+            panic!("Unauthorized");
+        }
+        admin.require_auth();
+
+        let run_key = DataKey::PayrollRun(run_id);
+        let mut run: PayrollRun = e
+            .storage()
+            .persistent()
+            .get(&run_key)
+            .expect("Run not found");
+
+        run.reconciliation_status = status;
+        e.storage().persistent().set(&run_key, &run);
+
+        e.events().publish(
+            (
+                symbol_short!("payroll"),
+                Symbol::new(&e, "reconciliation_updated"),
+            ),
+            (run_id, status),
+        );
+    }
 
     /// Finalize a `Pending` draft, making it permanently immutable.
     ///
@@ -864,10 +937,7 @@ impl Payroll {
         }
         current_admin.require_auth();
 
-        if e.storage()
-            .persistent()
-            .has(&DataKey::PendingAdminRotation)
-        {
+        if e.storage().persistent().has(&DataKey::PendingAdminRotation) {
             panic!("A pending admin rotation already exists");
         }
 
@@ -935,11 +1005,7 @@ impl Payroll {
         }
         current_admin.require_auth();
 
-        if !e
-            .storage()
-            .persistent()
-            .has(&DataKey::PendingAdminRotation)
-        {
+        if !e.storage().persistent().has(&DataKey::PendingAdminRotation) {
             panic!("No pending admin rotation to cancel");
         }
         e.storage()
@@ -947,7 +1013,10 @@ impl Payroll {
             .remove(&DataKey::PendingAdminRotation);
 
         e.events().publish(
-            (symbol_short!("payroll"), Symbol::new(&e, "admin_rot_cancel")),
+            (
+                symbol_short!("payroll"),
+                Symbol::new(&e, "admin_rot_cancel"),
+            ),
             current_admin,
         );
     }
@@ -979,6 +1048,7 @@ impl Payroll {
         e.storage()
             .persistent()
             .set(&DataKey::PendingTreasuryRotation, &proposal);
+
         e.events().publish(
             (
                 symbol_short!("payroll"),
@@ -1066,9 +1136,7 @@ impl Payroll {
 
     /// Return the pending admin rotation proposal, if any.
     pub fn get_pending_admin_rotation(e: Env) -> Option<PendingRotation> {
-        e.storage()
-            .persistent()
-            .get(&DataKey::PendingAdminRotation)
+        e.storage().persistent().get(&DataKey::PendingAdminRotation)
     }
 
     /// Return the pending treasury-owner rotation proposal, if any.
@@ -1491,12 +1559,8 @@ mod tests {
         let (payroll_client, admin, _treasury, _treasury_owner, _employee) =
             setup_simple_payroll(&env);
 
-        let id = payroll_client.create_run_draft(
-            &admin,
-            &10_000i128,
-            &20u32,
-            &Symbol::new(&env, "JAN"),
-        );
+        let id =
+            payroll_client.create_run_draft(&admin, &10_000i128, &20u32, &Symbol::new(&env, "JAN"));
         let draft = payroll_client.get_run_draft(&id);
 
         assert_eq!(draft.state, RunDraftState::Pending);
@@ -1511,12 +1575,8 @@ mod tests {
         let (payroll_client, admin, _treasury, _treasury_owner, _employee) =
             setup_simple_payroll(&env);
 
-        let id = payroll_client.create_run_draft(
-            &admin,
-            &10_000i128,
-            &20u32,
-            &Symbol::new(&env, "FEB"),
-        );
+        let id =
+            payroll_client.create_run_draft(&admin, &10_000i128, &20u32, &Symbol::new(&env, "FEB"));
         payroll_client.amend_run_draft(&admin, &id, &12_000i128, &22u32);
 
         let draft = payroll_client.get_run_draft(&id);
@@ -1532,12 +1592,8 @@ mod tests {
         let (payroll_client, admin, _treasury, _treasury_owner, _employee) =
             setup_simple_payroll(&env);
 
-        let id = payroll_client.create_run_draft(
-            &admin,
-            &8_000i128,
-            &15u32,
-            &Symbol::new(&env, "MAR"),
-        );
+        let id =
+            payroll_client.create_run_draft(&admin, &8_000i128, &15u32, &Symbol::new(&env, "MAR"));
         payroll_client.finalize_run_draft(&admin, &id);
 
         let draft = payroll_client.get_run_draft(&id);
@@ -1550,15 +1606,14 @@ mod tests {
         let (payroll_client, admin, _treasury, _treasury_owner, _employee) =
             setup_simple_payroll(&env);
 
-        let id = payroll_client.create_run_draft(
-            &admin,
-            &5_000i128,
-            &10u32,
-            &Symbol::new(&env, "APR"),
-        );
+        let id =
+            payroll_client.create_run_draft(&admin, &5_000i128, &10u32, &Symbol::new(&env, "APR"));
         payroll_client.finalize_run_draft(&admin, &id);
 
         let result = payroll_client.try_amend_run_draft(&admin, &id, &9_000i128, &18u32);
+        assert!(result.is_err());
+    }
+
     // ── Issue #103: per-payroll run nonce uniqueness ───────────────────────────
 
     #[test]
@@ -1699,12 +1754,7 @@ mod tests {
             setup_simple_payroll(&env);
 
         let attacker = Address::generate(&env);
-        payroll_client.create_run_draft(
-            &attacker,
-            &1_000i128,
-            &1u32,
-            &Symbol::new(&env, "MAY"),
-        );
+        payroll_client.create_run_draft(&attacker, &1_000i128, &1u32, &Symbol::new(&env, "MAY"));
     }
 
     // ── Issue #91: admin/treasury rotation ───────────────────────────────────
@@ -1769,7 +1819,6 @@ mod tests {
     }
 
     #[test]
-    fn test_treasury_rotation_full_flow() {
     fn test_batch_runs_without_draft_hash() {
         let env = Env::default();
         let (payroll_client, _admin, _treasury, _treasury_owner, employee) =
@@ -1868,8 +1917,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "A pending emergency request already exists")]
-    fn test_duplicate_emergency_request_rejected() {
+    fn test_treasury_rotation_full_flow() {
         let env = Env::default();
         let (payroll_client, _admin, _treasury, treasury_owner, _employee) =
             setup_simple_payroll(&env);
@@ -1899,11 +1947,28 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "A pending admin rotation already exists")]
-    fn test_duplicate_admin_rotation_proposal_rejected() {
+    #[should_panic(expected = "A pending emergency request already exists")]
+    fn test_duplicate_emergency_request_rejected() {
+        let env = Env::default();
+        let (payroll_client, _admin, _treasury, treasury_owner, _employee) =
+            setup_simple_payroll(&env);
+
         let recipient = Address::generate(&env);
         payroll_client.request_emergency_withdrawal(&treasury_owner, &100i128, &recipient);
         payroll_client.request_emergency_withdrawal(&treasury_owner, &200i128, &recipient);
+    }
+
+    #[test]
+    #[should_panic(expected = "A pending admin rotation already exists")]
+    fn test_duplicate_admin_rotation_proposal_rejected() {
+        let env = Env::default();
+        let (payroll_client, admin, _treasury, _treasury_owner, _employee) =
+            setup_simple_payroll(&env);
+
+        let new_admin1 = Address::generate(&env);
+        payroll_client.propose_admin_rotation(&admin, &new_admin1);
+        let new_admin2 = Address::generate(&env);
+        payroll_client.propose_admin_rotation(&admin, &new_admin2);
     }
 
     // ── Issue #134: reconciliation status tracking ─────────────────────────────

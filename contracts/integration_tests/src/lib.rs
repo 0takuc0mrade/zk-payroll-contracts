@@ -30,15 +30,15 @@ mod proof_helper;
 ///      unregistered employees cannot be paid.
 #[cfg(test)]
 mod e2e {
-    use proof_verifier::{ProofVerifier, ProofVerifierClient, VerificationKey};
     use payroll::{Payroll, PayrollClient};
     use payroll_registry::{PayrollRegistry, PayrollRegistryClient};
+    use proof_verifier::{ProofVerifier, ProofVerifierClient, VerificationKey};
     use salary_commitment::{SalaryCommitmentContract, SalaryCommitmentContractClient};
-    use token::{Token, TokenClient};
     use soroban_sdk::{
         testutils::{Address as _, Events},
         Address, BytesN, Env, Symbol, TryIntoVal, Vec,
     };
+    use token::{Token, TokenClient};
 
     // ── Helpers ──────────────────────────────────────────────────────────────
 

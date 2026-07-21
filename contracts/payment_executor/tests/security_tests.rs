@@ -303,7 +303,10 @@ fn test_retry_across_periods_succeeds_with_new_period() {
         &nullifier_1,
         &1,
     );
-    assert_eq!(replay_1.unwrap_err().unwrap(), PaymentError::ProofAlreadyUsed);
+    assert_eq!(
+        replay_1.unwrap_err().unwrap(),
+        PaymentError::ProofAlreadyUsed
+    );
 
     let replay_2 = executor.try_execute_payment(
         &company_id,
@@ -315,7 +318,10 @@ fn test_retry_across_periods_succeeds_with_new_period() {
         &nullifier_2,
         &2,
     );
-    assert_eq!(replay_2.unwrap_err().unwrap(), PaymentError::ProofAlreadyUsed);
+    assert_eq!(
+        replay_2.unwrap_err().unwrap(),
+        PaymentError::ProofAlreadyUsed
+    );
 }
 
 /// Acceptance Criteria: Idempotent Retry Within Same Period
@@ -341,7 +347,16 @@ fn test_retry_same_period_detects_already_paid() {
     let nullifier = BytesN::from_array(&env, &[63u8; 32]);
 
     // First payment in period 1
-    executor.execute_payment(&company_id, &employee, &1000, &proof_a, &proof_b, &proof_c, &nullifier, &1);
+    executor.execute_payment(
+        &company_id,
+        &employee,
+        &1000,
+        &proof_a,
+        &proof_b,
+        &proof_c,
+        &nullifier,
+        &1,
+    );
 
     assert!(executor.is_paid(&employee, &1));
     assert_eq!(executor.get_total_paid(&company_id), 1000);
@@ -359,7 +374,10 @@ fn test_retry_same_period_detects_already_paid() {
     );
 
     // Should fail due to ProofAlreadyUsed (nullifier already consumed)
-    assert_eq!(retry_result.unwrap_err().unwrap(), PaymentError::ProofAlreadyUsed);
+    assert_eq!(
+        retry_result.unwrap_err().unwrap(),
+        PaymentError::ProofAlreadyUsed
+    );
 
     // Verify no duplicate payment was recorded
     assert_eq!(executor.get_total_paid(&company_id), 1000);
@@ -388,7 +406,16 @@ fn test_period_isolation_prevents_cross_period_replay() {
     let nullifier = BytesN::from_array(&env, &[83u8; 32]);
 
     // Execute payment in period 1
-    executor.execute_payment(&company_id, &employee, &2000, &proof_a, &proof_b, &proof_c, &nullifier, &1);
+    executor.execute_payment(
+        &company_id,
+        &employee,
+        &2000,
+        &proof_a,
+        &proof_b,
+        &proof_c,
+        &nullifier,
+        &1,
+    );
     assert!(executor.is_paid(&employee, &1));
 
     // Create a new period (period 2)
@@ -407,7 +434,10 @@ fn test_period_isolation_prevents_cross_period_replay() {
     );
 
     // Should fail because nullifier was already consumed in period 1
-    assert_eq!(cross_period_result.unwrap_err().unwrap(), PaymentError::ProofAlreadyUsed);
+    assert_eq!(
+        cross_period_result.unwrap_err().unwrap(),
+        PaymentError::ProofAlreadyUsed
+    );
 
     // Verify employee is not marked as paid in period 2
     assert!(!executor.is_paid(&employee, &2));
@@ -491,7 +521,10 @@ fn test_retry_multiple_employees_detects_duplicates() {
         &nullifier_1,
         &1,
     );
-    assert_eq!(replay_1.unwrap_err().unwrap(), PaymentError::ProofAlreadyUsed);
+    assert_eq!(
+        replay_1.unwrap_err().unwrap(),
+        PaymentError::ProofAlreadyUsed
+    );
 
     let replay_2 = executor.try_execute_payment(
         &company_id,
@@ -503,7 +536,10 @@ fn test_retry_multiple_employees_detects_duplicates() {
         &nullifier_2,
         &1,
     );
-    assert_eq!(replay_2.unwrap_err().unwrap(), PaymentError::ProofAlreadyUsed);
+    assert_eq!(
+        replay_2.unwrap_err().unwrap(),
+        PaymentError::ProofAlreadyUsed
+    );
 
     // Attempt to pay employee A again with different proof (should fail with AlreadyPaid)
     let proof_a_3 = BytesN::from_array(&env, &[120u8; 64]);
@@ -521,7 +557,10 @@ fn test_retry_multiple_employees_detects_duplicates() {
         &nullifier_3,
         &1,
     );
-    assert_eq!(double_pay_result.unwrap_err().unwrap(), PaymentError::AlreadyPaid);
+    assert_eq!(
+        double_pay_result.unwrap_err().unwrap(),
+        PaymentError::AlreadyPaid
+    );
 
     // Final verification: total paid unchanged
     assert_eq!(executor.get_total_paid(&company_id), 800);
