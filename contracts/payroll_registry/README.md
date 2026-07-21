@@ -35,7 +35,8 @@ The `CompanyInfo` struct definition in Rust:
 
 ## Notes
 
-- Company IDs are allocated sequentially and persisted with `DataKey::NextCompanyId`.
+- Company IDs are allocated sequentially and persisted with `DataKey::CompanySequence`.
+- Duplicate company registration for the same admin address is rejected with `"Company already registered"`.
 - Admin-gated methods load `CompanyInfo` via `DataKey::Company(company_id)` and call
   `info.admin.require_auth()` before mutating employee state.
 

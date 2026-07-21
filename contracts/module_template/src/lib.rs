@@ -100,29 +100,27 @@ impl ModuleTemplate {
     }
 }
 
-
-    // TODO: implement module-specific entry-points below.
-    //
-    // Pattern for admin-gated mutation:
-    //
-    //   pub fn some_action(e: Env, admin: Address, ...) -> Result<(), ModuleError> {
-    //       let stored: Address = e
-    //           .storage()
-    //           .persistent()
-    //           .get(&DataKey::Admin)
-    //           .ok_or(ModuleError::NotInitialized)?;
-    //       if admin != stored { return Err(ModuleError::Unauthorized); }
-    //       admin.require_auth();
-    //
-    //       // ... mutate state ...
-    //
-    //       e.events().publish(
-    //           (symbol_short!("module"), Symbol::new(&e, "some_action")),
-    //           /* event data */,
-    //       );
-    //       Ok(())
-    //   }
-}
+// TODO: implement module-specific entry-points below.
+//
+// Pattern for admin-gated mutation:
+//
+//   pub fn some_action(e: Env, admin: Address, ...) -> Result<(), ModuleError> {
+//       let stored: Address = e
+//           .storage()
+//           .persistent()
+//           .get(&DataKey::Admin)
+//           .ok_or(ModuleError::NotInitialized)?;
+//       if admin != stored { return Err(ModuleError::Unauthorized); }
+//       admin.require_auth();
+//
+//       // ... mutate state ...
+//
+//       e.events().publish(
+//           (symbol_short!("module"), Symbol::new(&e, "some_action")),
+//           /* event data */,
+//       );
+//       Ok(())
+//   }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
@@ -135,9 +133,6 @@ mod tests {
     fn test_initialize_sets_admin() {
         let env = Env::default();
         env.mock_all_auths();
-        let contract_id = env.register_contract(None, ModuleTemplate);
-        let client = ModuleTemplateClient::new(&env, &contract_id);
-
         let contract_id = env.register_contract(None, ModuleTemplate);
         let client = ModuleTemplateClient::new(&env, &contract_id);
 
@@ -154,16 +149,6 @@ mod tests {
         let client = ModuleTemplateClient::new(&env, &contract_id);
         let admin = Address::generate(&env);
         client.initialize(&admin);
-        let result = client.try_initialize(&admin);
-        assert_eq!(result, Err(Ok(ModuleError::AlreadyInitialized)));
-    }
-
-        let contract_id = env.register_contract(None, ModuleTemplate);
-        let client = ModuleTemplateClient::new(&env, &contract_id);
-
-        let admin = Address::generate(&env);
-        client.initialize(&admin);
-
         let result = client.try_initialize(&admin);
         assert_eq!(result, Err(Ok(ModuleError::AlreadyInitialized)));
     }

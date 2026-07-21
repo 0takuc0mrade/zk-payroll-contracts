@@ -66,6 +66,8 @@ pub enum DataKey {
     PendingAdminRotation(u64),
     /// Pending treasury rotation for a company (issue #91).
     PendingTreasuryRotation(u64),
+    /// Per-admin company ID lookup (issue #152: reject duplicate company registration).
+    CompanyAdmin(Address),
 }
 
 // ---------------------------------------------------------------------------
@@ -100,12 +102,7 @@ pub trait PayrollRegistryTrait {
 
     /// Set the eligibility status for a registered employee.
     /// Requires authorisation from the company admin.
-    fn set_employee_status(
-        env: Env,
-        company_id: u64,
-        employee: Address,
-        status: EmployeeStatus,
-    );
+    fn set_employee_status(env: Env, company_id: u64, employee: Address, status: EmployeeStatus);
 
     /// Return the eligibility status of an employee.
     /// Returns `Incomplete` if no explicit status has been set.
@@ -117,7 +114,12 @@ pub trait PayrollRegistryTrait {
     // ── Issue #91: company-level admin/treasury rotation ─────────────────────
 
     /// Propose a new company admin (step 1 of 2).
-    fn propose_admin_rotation(env: Env, company_id: u64, current_admin: Address, new_admin: Address);
+    fn propose_admin_rotation(
+        env: Env,
+        company_id: u64,
+        current_admin: Address,
+        new_admin: Address,
+    );
 
     /// Accept a pending admin rotation (step 2 of 2).
     fn accept_admin_rotation(env: Env, company_id: u64, new_admin: Address);
@@ -149,6 +151,14 @@ impl PayrollRegistryTrait for PayrollRegistry {
     fn register_company(env: Env, admin: Address, treasury: Address) -> u64 {
         admin.require_auth();
 
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::CompanyAdmin(admin.clone()))
+        {
+            panic!("Company already registered");
+        }
+
         let id: u64 = env
             .storage()
             .persistent()
@@ -165,6 +175,9 @@ impl PayrollRegistryTrait for PayrollRegistry {
             treasury: treasury.clone(),
         };
         env.storage().persistent().set(&DataKey::Company(id), &info);
+        env.storage()
+            .persistent()
+            .set(&DataKey::CompanyAdmin(admin.clone()), &id);
 
         env.events().publish(
             (Symbol::new(&env, "CompanyRegistered"), id),
@@ -188,14 +201,13 @@ impl PayrollRegistryTrait for PayrollRegistry {
         let emp = employee.clone();
         env.storage()
             .persistent()
-            .set(&DataKey::Employee(company_id, employee.clone()), &commitment);
+            .set(&DataKey::Employee(company_id, emp.clone()), &commitment);
 
         // Default status for newly registered employees is Active (issue #90).
         env.storage().persistent().set(
-            &DataKey::EmpStatus(company_id, employee),
+            &DataKey::EmpStatus(company_id, emp),
             &EmployeeStatus::Active,
         );
-            .set(&DataKey::Employee(company_id, emp), &commitment);
 
         env.events().publish(
             (Symbol::new(&env, "EmployeeAdded"), company_id, employee),
@@ -268,12 +280,7 @@ impl PayrollRegistryTrait for PayrollRegistry {
 
     // ── Issue #90: employee eligibility ──────────────────────────────────────
 
-    fn set_employee_status(
-        env: Env,
-        company_id: u64,
-        employee: Address,
-        status: EmployeeStatus,
-    ) {
+    fn set_employee_status(env: Env, company_id: u64, employee: Address, status: EmployeeStatus) {
         let info: CompanyInfo = env
             .storage()
             .persistent()
@@ -371,13 +378,21 @@ impl PayrollRegistryTrait for PayrollRegistry {
             .get(&DataKey::Company(company_id))
             .expect("Company not found");
 
-        info.admin = new_admin;
+        let old_admin = info.admin.clone();
+
+        info.admin = new_admin.clone();
         env.storage()
             .persistent()
             .set(&DataKey::Company(company_id), &info);
         env.storage()
             .persistent()
             .remove(&DataKey::PendingAdminRotation(company_id));
+        env.storage()
+            .persistent()
+            .remove(&DataKey::CompanyAdmin(old_admin));
+        env.storage()
+            .persistent()
+            .set(&DataKey::CompanyAdmin(new_admin), &company_id);
     }
 
     fn cancel_admin_rotation(env: Env, company_id: u64, current_admin: Address) {

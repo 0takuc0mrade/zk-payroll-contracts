@@ -196,7 +196,11 @@ impl AuditModule {
 
         // Emit revocation event for audit trail
         env.events().publish(
-            (Symbol::new(&env, "AuditAccessRevoked"), admin, auditor.clone()),
+            (
+                Symbol::new(&env, "AuditAccessRevoked"),
+                admin,
+                auditor.clone(),
+            ),
             (env.ledger().timestamp(),),
         );
         // topics : ("AuditAccessRevoked", admin, auditor)
@@ -492,10 +496,7 @@ impl AuditModule {
         };
 
         env.events().publish(
-            (
-                Symbol::new(&env, "AuditSummaryExported"),
-                auditor,
-            ),
+            (Symbol::new(&env, "AuditSummaryExported"), auditor),
             (company_id, period_start, period_end, total),
         );
 
