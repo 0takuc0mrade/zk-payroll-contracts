@@ -751,57 +751,52 @@ impl Payroll {
         new_total_amount: i128,
         new_employee_count: u32,
     ) {
-        let addrs: ContractAddresses = e.storage().persistent().get(&DataKey::Addresses).expect("Not initialized");
-        if admin != addrs.admin { panic!("Unauthorized"); }
-        admin.require_auth();
-        let mut draft: PayrollRunDraft = e.storage().persistent().get(&DataKey::RunDraft(draft_id)).expect("Draft not found");
-        if draft.state != RunDraftState::Pending { panic!("Only pending drafts can be amended"); }
-        if new_total_amount <= 0 { panic!("total_amount must be positive"); }
-        draft.total_amount=new_total_amount; draft.employee_count=new_employee_count; draft.amendment_count+=1; e.storage().persistent().set(&DataKey::RunDraft(draft_id), &draft); e.events().publish((symbol_short!("payroll"), Symbol::new(&e,"draft_amended")),(draft_id,new_total_amount,draft.amendment_count));
-    }
-
     /// Update the reconciliation status of a completed payroll run.
     ///
     /// Only the `admin` may update the reconciliation status.
     /// Emits a `reconciliation_updated` event.
     pub fn update_reconciliation_status(
-    e: Env,
-    admin: Address,
-    run_id: u64,
-    status: ReconciliationStatus,
-) {
-    let addrs: ContractAddresses = e
-        .storage()
-        .persistent()
-        .get(&DataKey::Addresses)
-        .expect("Not initialized");
+        e: Env,
+        admin: Address,
+        run_id: u64,
+        status: ReconciliationStatus,
+    ) {
+        let addrs: ContractAddresses = e
+            .storage()
+            .persistent()
+            .get(&DataKey::Addresses)
+            .expect("Not initialized");
+        if admin != addrs.admin {
+            panic!("Unauthorized");
+        }
+        admin.require_auth();
 
-    if admin != addrs.admin {
-        panic!("Unauthorized");
+        let mut draft: PayrollRunDraft = e
+            .storage()
+            .persistent()
+            .get(&DataKey::RunDraft(draft_id))
+            .expect("Draft not found");
+
+        if draft.state != RunDraftState::Pending {
+            panic!("Only pending drafts can be amended");
+        }
+        if new_total_amount <= 0 {
+            panic!("total_amount must be positive");
+        }
+
+        draft.total_amount = new_total_amount;
+        draft.employee_count = new_employee_count;
+        draft.amendment_count += 1;
+
+        e.storage()
+            .persistent()
+            .set(&DataKey::RunDraft(draft_id), &draft);
+
+        e.events().publish(
+            (symbol_short!("payroll"), Symbol::new(&e, "draft_amended")),
+            (draft_id, new_total_amount, draft.amendment_count),
+        );
     }
-
-    admin.require_auth();
-
-    let run_key = DataKey::PayrollRun(run_id);
-
-    let mut run: PayrollRun = e
-        .storage()
-        .persistent()
-        .get(&run_key)
-        .expect("Payroll run not found");
-
-    run.reconciliation_status = status.clone();
-
-    e.storage().persistent().set(&run_key, &run);
-
-    e.events().publish(
-        (
-            symbol_short!("payroll"),
-            Symbol::new(&e, "reconciliation_updated"),
-        ),
-        (run_id, status),
-    );
-}
 
     /// Finalize a `Pending` draft, making it permanently immutable.
     ///
@@ -979,6 +974,16 @@ impl Payroll {
         e.storage()
             .persistent()
             .set(&DataKey::PendingTreasuryRotation, &proposal);
+        let run_key = DataKey::PayrollRun(run_id);
+        let mut run: PayrollRun = e
+            .storage()
+            .persistent()
+            .get(&run_key)
+            .expect("Run not found");
+
+        run.reconciliation_status = status;
+        e.storage().persistent().set(&run_key, &run);
+
         e.events().publish(
             (
                 symbol_short!("payroll"),
@@ -1077,6 +1082,13 @@ impl Payroll {
             .persistent()
             .get(&DataKey::PendingTreasuryRotation)
     }
+                Symbol::new(&e, "reconciliation_updated"),
+            ),
+            (run_id, status),
+        );
+ 
+   }
+   
 }
 
 #[cfg(test)]
