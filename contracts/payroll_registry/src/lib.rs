@@ -102,12 +102,7 @@ pub trait PayrollRegistryTrait {
 
     /// Set the eligibility status for a registered employee.
     /// Requires authorisation from the company admin.
-    fn set_employee_status(
-        env: Env,
-        company_id: u64,
-        employee: Address,
-        status: EmployeeStatus,
-    );
+    fn set_employee_status(env: Env, company_id: u64, employee: Address, status: EmployeeStatus);
 
     /// Return the eligibility status of an employee.
     /// Returns `Incomplete` if no explicit status has been set.
@@ -119,7 +114,12 @@ pub trait PayrollRegistryTrait {
     // ── Issue #91: company-level admin/treasury rotation ─────────────────────
 
     /// Propose a new company admin (step 1 of 2).
-    fn propose_admin_rotation(env: Env, company_id: u64, current_admin: Address, new_admin: Address);
+    fn propose_admin_rotation(
+        env: Env,
+        company_id: u64,
+        current_admin: Address,
+        new_admin: Address,
+    );
 
     /// Accept a pending admin rotation (step 2 of 2).
     fn accept_admin_rotation(env: Env, company_id: u64, new_admin: Address);
@@ -280,12 +280,7 @@ impl PayrollRegistryTrait for PayrollRegistry {
 
     // ── Issue #90: employee eligibility ──────────────────────────────────────
 
-    fn set_employee_status(
-        env: Env,
-        company_id: u64,
-        employee: Address,
-        status: EmployeeStatus,
-    ) {
+    fn set_employee_status(env: Env, company_id: u64, employee: Address, status: EmployeeStatus) {
         let info: CompanyInfo = env
             .storage()
             .persistent()

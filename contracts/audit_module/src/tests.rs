@@ -526,8 +526,7 @@ fn test_export_audit_summary_returns_correct_counts() {
 
     let company_id = Symbol::new(&env, "default");
     let ts = env.ledger().timestamp();
-    let summary =
-        client.export_audit_summary(&auditor, &company_id, &0u64, &(ts + 1_000_000u64));
+    let summary = client.export_audit_summary(&auditor, &company_id, &0u64, &(ts + 1_000_000u64));
 
     assert_eq!(summary.company_id, company_id);
     assert_eq!(summary.exported_by, auditor);
@@ -564,12 +563,8 @@ fn test_export_audit_summary_excludes_out_of_period_entries() {
     let company_id = Symbol::new(&env, "default");
     // Request a period that is far in the future — no entries should match.
     let far_future: u64 = 999_999_999_999;
-    let summary = client.export_audit_summary(
-        &auditor,
-        &company_id,
-        &far_future,
-        &(far_future + 1_000),
-    );
+    let summary =
+        client.export_audit_summary(&auditor, &company_id, &far_future, &(far_future + 1_000));
 
     assert_eq!(summary.total_audit_entries, 0);
     assert_eq!(summary.verification_pass_count, 0);
