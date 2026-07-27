@@ -195,6 +195,20 @@ impl Payroll {
         e.storage().persistent().set(&DataKey::RunCounter, &0u64);
     }
 
+    fn require_not_paused(e: &Env) {
+        if e.storage().persistent().has(&DataKey::PauseManager) {
+            let pm_addr: Address = e
+                .storage()
+                .persistent()
+                .get(&DataKey::PauseManager)
+                .unwrap();
+            let pm_client = PauseManagerClient::new(e, &pm_addr);
+            if pm_client.is_paused() {
+                panic!("Payroll is paused");
+            }
+        }
+    }
+
     pub fn set_pause_manager(e: Env, pause_manager: Address) {
         let addrs: ContractAddresses = e
             .storage()
@@ -208,6 +222,7 @@ impl Payroll {
     }
 
     pub fn deposit(e: Env, from: Address, amount: i128) {
+        Self::require_not_paused(&e);
         if amount <= 0 {
             panic!("Deposit amount must be positive");
         }
@@ -301,6 +316,7 @@ impl Payroll {
         amount: i128,
         recipient: Address,
     ) {
+        Self::require_not_paused(&e);
         if amount <= 0 {
             panic!("Amount must be positive");
         }
@@ -340,6 +356,7 @@ impl Payroll {
     /// transferred to the recipient specified in the request and the pending
     /// request is cleared from storage, ensuring it cannot be replayed.
     pub fn approve_emergency_withdrawal(e: Env, admin: Address) {
+        Self::require_not_paused(&e);
         let addrs: ContractAddresses = e
             .storage()
             .persistent()
@@ -763,85 +780,6 @@ impl Payroll {
     /// Only the `admin` may update the reconciliation status.
     /// Emits a `reconciliation_updated` event.
     pub fn update_reconciliation_status(
-    e: Env,
-    admin: Address,
-    run_id: u64,
-    status: ReconciliationStatus,
-) {
-    let addrs: ContractAddresses = e
-        .storage()
-        .persistent()
-        .get(&DataKey::Addresses)
-        .expect("Not initialized");
-
-    if admin != addrs.admin {
-        panic!("Unauthorized");
-    }
-
-    admin.require_auth();
-
-    let run_key = DataKey::PayrollRun(run_id);
-
-    let mut run: PayrollRun = e
-        .storage()
-        .persistent()
-        .get(&run_key)
-        .expect("Payroll run not found");
-
-    run.reconciliation_status = status.clone();
-
-    e.storage().persistent().set(&run_key, &run);
-
-    e.events().publish(
-        (
-            symbol_short!("payroll"),
-            Symbol::new(&e, "reconciliation_updated"),
-        ),
-        (run_id, status),
-    );
-}
-        let addrs: ContractAddresses = e
-            .storage()
-            .persistent()
-            .get(&DataKey::Addresses)
-            .expect("Not initialized");
-        if admin != addrs.admin {
-            panic!("Unauthorized");
-        }
-        admin.require_auth();
-
-        let mut draft: PayrollRunDraft = e
-            .storage()
-            .persistent()
-            .get(&DataKey::RunDraft(draft_id))
-            .expect("Draft not found");
-
-        if draft.state != RunDraftState::Pending {
-            panic!("Only pending drafts can be amended");
-        }
-        if new_total_amount <= 0 {
-            panic!("total_amount must be positive");
-        }
-
-        draft.total_amount = new_total_amount;
-        draft.employee_count = new_employee_count;
-        draft.amendment_count += 1;
-
-        e.storage()
-            .persistent()
-            .set(&DataKey::RunDraft(draft_id), &draft);
-
-        e.events().publish(
-            (symbol_short!("payroll"), Symbol::new(&e, "draft_amended")),
-            (draft_id, new_total_amount, draft.amendment_count),
-        );
-    }
-
-    /// Update the reconciliation status of a completed payroll run.
-    ///
-    /// Only the `admin` may update the reconciliation status.
-    /// Emits a `reconciliation_updated` event.
-    pub fn update_reconciliation_status(
         e: Env,
         admin: Address,
         run_id: u64,
@@ -852,19 +790,22 @@ impl Payroll {
             .persistent()
             .get(&DataKey::Addresses)
             .expect("Not initialized");
+
         if admin != addrs.admin {
             panic!("Unauthorized");
         }
+
         admin.require_auth();
 
         let run_key = DataKey::PayrollRun(run_id);
+
         let mut run: PayrollRun = e
             .storage()
             .persistent()
             .get(&run_key)
             .expect("Run not found");
 
-        run.reconciliation_status = status;
+        run.reconciliation_status = status.clone();
         e.storage().persistent().set(&run_key, &run);
 
         e.events().publish(
@@ -1023,6 +964,7 @@ impl Payroll {
 
     /// Propose a new treasury owner (step 1 of 2).
     pub fn propose_treasury_rotation(e: Env, current_owner: Address, new_owner: Address) {
+        Self::require_not_paused(&e);
         let stored_owner: Address = e
             .storage()
             .persistent()
@@ -1060,6 +1002,7 @@ impl Payroll {
 
     /// Accept a treasury-owner rotation (step 2 of 2).
     pub fn accept_treasury_rotation(e: Env, new_owner: Address) {
+        Self::require_not_paused(&e);
         let proposal: PendingRotation = e
             .storage()
             .persistent()
@@ -2059,9 +2002,6 @@ mod tests {
         let (payroll_client, admin, _treasury, _treasury_owner, _employee) =
             setup_simple_payroll(&env);
 
-        let new_admin = Address::generate(&env);
-        payroll_client.propose_admin_rotation(&admin, &new_admin);
-        payroll_client.propose_admin_rotation(&admin, &new_admin);
         payroll_client.update_reconciliation_status(
             &admin,
             &999u64,
@@ -2164,5 +2104,84 @@ mod tests {
         let (p2, a2, e2) = single_payment_batch(&env, &employee, 1000);
         let result = payroll_client.try_prepare_payroll_run(&p2, &a2, &e2, &1000, &nonce, &None);
         assert!(result.is_err());
+    }
+
+    #[test]
+    #[should_panic(expected = "Pending run not found")]
+    fn test_cancel_payroll_run_twice_fails() {
+        let env = Env::default();
+        let (payroll_client, admin, _treasury, _treasury_owner, employee) =
+            setup_simple_payroll(&env);
+
+        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
+        let run_id = payroll_client.prepare_payroll_run(
+            &proofs,
+            &amounts,
+            &employees,
+            &1000,
+            &test_nonce(&env, 44),
+            &None,
+        );
+
+        payroll_client.cancel_payroll_run(&admin, &run_id);
+        payroll_client.cancel_payroll_run(&admin, &run_id);
+    }
+
+    #[test]
+    fn test_cancel_pending_payroll_run_frees_nonce_and_cleans_state() {
+        let env = Env::default();
+        let (payroll_client, admin, _treasury, _treasury_owner, employee) =
+            setup_simple_payroll(&env);
+
+        let nonce = test_nonce(&env, 45);
+        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
+        let run_id = payroll_client.prepare_payroll_run(
+            &proofs,
+            &amounts,
+            &employees,
+            &1000,
+            &nonce,
+            &None,
+        );
+
+        assert!(payroll_client.get_pending_run(&run_id).is_some());
+        payroll_client.cancel_payroll_run(&admin, &run_id);
+
+        assert!(payroll_client.get_pending_run(&run_id).is_none());
+    }
+
+    #[test]
+    #[should_panic(expected = "Payroll is paused")]
+    fn test_pause_blocks_deposit() {
+        let env = Env::default();
+        let (payroll_client, admin, treasury, _treasury_owner, _employee) =
+            setup_simple_payroll(&env);
+
+        let pm_id = env.register_contract(None, PauseManager);
+        let pm_client = PauseManagerClient::new(&env, &pm_id);
+        pm_client.initialize(&admin);
+
+        payroll_client.set_pause_manager(&pm_id);
+        pm_client.pause();
+
+        payroll_client.deposit(&treasury, &100i128);
+    }
+
+    #[test]
+    #[should_panic(expected = "Payroll is paused")]
+    fn test_pause_blocks_emergency_withdrawal_request() {
+        let env = Env::default();
+        let (payroll_client, admin, _treasury, treasury_owner, _employee) =
+            setup_simple_payroll(&env);
+
+        let pm_id = env.register_contract(None, PauseManager);
+        let pm_client = PauseManagerClient::new(&env, &pm_id);
+        pm_client.initialize(&admin);
+
+        payroll_client.set_pause_manager(&pm_id);
+        pm_client.pause();
+
+        let recipient = Address::generate(&env);
+        payroll_client.request_emergency_withdrawal(&treasury_owner, &500i128, &recipient);
     }
 }

@@ -556,3 +556,26 @@ fn test_register_company_duplicate_registration_panics() {
     // Duplicate registration panics
     client.register_company(&admin, &treasury);
 }
+
+#[test]
+#[should_panic(expected = "Payroll is paused")]
+fn test_pause_blocks_employee_addition() {
+    use pause_manager::{PauseManager, PauseManagerClient};
+
+    let (env, contract_id) = setup();
+    let client = PayrollRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let company_id = client.register_company(&admin, &treasury);
+
+    let pm_id = env.register_contract(None, PauseManager);
+    let pm_client = PauseManagerClient::new(&env, &pm_id);
+    pm_client.initialize(&admin);
+
+    client.set_pause_manager(&admin, &pm_id);
+    pm_client.pause();
+
+    let employee = Address::generate(&env);
+    let commitment = BytesN::from_array(&env, &[1u8; 32]);
+    client.add_employee(&company_id, &employee, &commitment);
+}

@@ -1,5 +1,6 @@
 #![no_std]
 
+use pause_manager::PauseManagerClient;
 use soroban_sdk::{contract, contractimpl, contracttype, Address, BytesN, Env, Symbol};
 
 // ---------------------------------------------------------------------------
@@ -68,6 +69,8 @@ pub enum DataKey {
     PendingTreasuryRotation(u64),
     /// Per-admin company ID lookup (issue #152: reject duplicate company registration).
     CompanyAdmin(Address),
+    /// Pause manager address (issue #167).
+    PauseManager,
 }
 
 // ---------------------------------------------------------------------------
@@ -147,6 +150,30 @@ pub trait PayrollRegistryTrait {
 pub struct PayrollRegistry;
 
 #[contractimpl]
+impl PayrollRegistry {
+    fn require_not_paused(env: &Env) {
+        if env.storage().persistent().has(&DataKey::PauseManager) {
+            let pm_addr: Address = env
+                .storage()
+                .persistent()
+                .get(&DataKey::PauseManager)
+                .unwrap();
+            let pm_client = PauseManagerClient::new(env, &pm_addr);
+            if pm_client.is_paused() {
+                panic!("Payroll is paused");
+            }
+        }
+    }
+
+    pub fn set_pause_manager(env: Env, admin: Address, pause_manager: Address) {
+        admin.require_auth();
+        env.storage()
+            .persistent()
+            .set(&DataKey::PauseManager, &pause_manager);
+    }
+}
+
+#[contractimpl]
 impl PayrollRegistryTrait for PayrollRegistry {
     fn register_company(env: Env, admin: Address, treasury: Address) -> u64 {
         admin.require_auth();
@@ -190,6 +217,7 @@ impl PayrollRegistryTrait for PayrollRegistry {
     }
 
     fn add_employee(env: Env, company_id: u64, employee: Address, commitment: BytesN<32>) {
+        Self::require_not_paused(&env);
         let info: CompanyInfo = env
             .storage()
             .persistent()
@@ -218,6 +246,7 @@ impl PayrollRegistryTrait for PayrollRegistry {
     }
 
     fn remove_employee(env: Env, company_id: u64, employee: Address) {
+        Self::require_not_paused(&env);
         let info: CompanyInfo = env
             .storage()
             .persistent()
@@ -240,6 +269,7 @@ impl PayrollRegistryTrait for PayrollRegistry {
     }
 
     fn update_commitment(env: Env, company_id: u64, employee: Address, new_commitment: BytesN<32>) {
+        Self::require_not_paused(&env);
         let info: CompanyInfo = env
             .storage()
             .persistent()
@@ -281,6 +311,7 @@ impl PayrollRegistryTrait for PayrollRegistry {
     // ── Issue #90: employee eligibility ──────────────────────────────────────
 
     fn set_employee_status(env: Env, company_id: u64, employee: Address, status: EmployeeStatus) {
+        Self::require_not_paused(&env);
         let info: CompanyInfo = env
             .storage()
             .persistent()
