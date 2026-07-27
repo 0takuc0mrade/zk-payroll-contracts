@@ -219,6 +219,19 @@ impl PaymentExecutor {
             return Err(PaymentError::PeriodAlreadyExists);
         }
 
+        if next_id > 1 {
+            let prev_key = DataKey::Period(company_id, next_id - 1);
+            if let Some(prev_period) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, PayrollPeriod>(&prev_key)
+            {
+                if !prev_period.closed {
+                    return Err(PaymentError::PeriodAlreadyExists);
+                }
+            }
+        }
+
         let period = PayrollPeriod {
             period_id: next_id,
             company_id,
@@ -749,6 +762,27 @@ mod tests {
         assert_eq!(result.company_id, company_id);
         assert!(!result.closed);
         assert_eq!(result.payment_count, 0);
+    }
+
+    #[test]
+    fn test_duplicate_period_creation_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, PaymentExecutor);
+        let client = PaymentExecutorClient::new(&env, &contract_id);
+
+        let addresses = setup_addresses(&env);
+        client.initialize(&addresses);
+
+        let registry_client = PayrollRegistryClient::new(&env, &addresses.registry);
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let company_id = registry_client.register_company(&admin, &treasury);
+
+        let _ = client.create_period(&company_id);
+
+        let result = client.try_create_period(&company_id);
+        assert_eq!(result.unwrap_err().unwrap(), PaymentError::PeriodAlreadyExists);
     }
 
     #[test]

@@ -114,6 +114,7 @@ fn test_proof_replay_protection() {
         &1,
     );
 
+    executor.close_period(&company_id, &1);
     executor.create_period(&company_id);
 
     let result = executor.try_execute_payment(
@@ -192,7 +193,7 @@ fn test_reentrancy_state_updates_before_external_calls() {
     let proof_c = BytesN::from_array(&env, &[7u8; 64]);
     let nullifier = BytesN::from_array(&env, &[8u8; 32]);
 
-    executor.create_period(&company_id);
+    executor.close_period(&company_id, &1);
     executor.create_period(&company_id);
 
     executor.execute_payment(
@@ -268,6 +269,7 @@ fn test_retry_across_periods_succeeds_with_new_period() {
     assert_eq!(executor.get_total_paid(&company_id), 500);
 
     // Create a new period (period 2)
+    executor.close_period(&company_id, &1);
     executor.create_period(&company_id);
 
     // Payment 2 in period 2 with different proof/amount
@@ -301,7 +303,7 @@ fn test_retry_across_periods_succeeds_with_new_period() {
         &proof_b_1,
         &proof_c_1,
         &nullifier_1,
-        &1,
+        &2,
     );
     assert_eq!(
         replay_1.unwrap_err().unwrap(),
@@ -419,6 +421,7 @@ fn test_period_isolation_prevents_cross_period_replay() {
     assert!(executor.is_paid(&employee, &1));
 
     // Create a new period (period 2)
+    executor.close_period(&company_id, &1);
     executor.create_period(&company_id);
 
     // Attempt to reuse same proof in period 2 (should fail due to nullifier)
