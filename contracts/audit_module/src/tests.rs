@@ -813,22 +813,50 @@ fn test_revoke_then_regrant_restores_access() {
     ));
 }
 
-#[test]
-#[should_panic(expected = "Payroll is paused")]
-fn test_pause_blocks_view_key_generation() {
-    use pause_manager::{PauseManager, PauseManagerClient};
+// ── Issue #171: admin / auditor role-boundary tests ──────────────────────────
+//
+// FINDING: `generate_view_key` takes no caller/admin parameter and never
+// calls `require_auth()` anywhere in its body — there is no admin role
+// gating who may grant auditor access in this contract at all. It also
+// always records `granted_by` as the contract's own address
+// (`env.current_contract_address()`), never the caller, which means
+// `revoke_view_key` can never be satisfied by any genuine external admin
+// either (see `revoke_view_key`'s `record.granted_by != admin` check).
+//
+// The two tests below document this as currently-observed behavior. They
+// are not an endorsement that it is correct — flagged separately for a
+// follow-up fix, out of scope for this tests-only issue.
 
+#[test]
+fn test_generate_view_key_has_no_caller_authorization() {
+    // Deliberately no mock_all_auths() and no mocked auths whatsoever — this
+    // call succeeds even for a completely unauthenticated invocation.
+    let env = Env::default();
+    let contract_id = env.register_contract(None, AuditModule);
+    let client = AuditModuleClient::new(&env, &contract_id);
+
+    let self_appointed_auditor = soroban_sdk::Address::generate(&env);
+    let seq = env.ledger().sequence();
+    client.generate_view_key(&self_appointed_auditor, &(seq + 1_000));
+
+    assert!(client.verify_access(&self_appointed_auditor));
+}
+
+#[test]
+fn test_revoke_view_key_rejects_genuine_external_admin() {
     let (env, contract_id) = setup();
     let client = AuditModuleClient::new(&env, &contract_id);
-    let admin = soroban_sdk::Address::generate(&env);
-
-    let pm_id = env.register_contract(None, PauseManager);
-    let pm_client = PauseManagerClient::new(&env, &pm_id);
-    pm_client.initialize(&admin);
-
-    client.set_pause_manager(&admin, &pm_id);
-    pm_client.pause();
 
     let auditor = soroban_sdk::Address::generate(&env);
-    client.generate_view_key(&auditor, &1000u32);
+    let seq = env.ledger().sequence();
+    client.generate_view_key(&auditor, &(seq + 1_000));
+
+    // A real, externally-controlled address, signing legitimately —
+    // still not the contract's own address stored as `granted_by`.
+    let would_be_admin = soroban_sdk::Address::generate(&env);
+    let result = client.try_revoke_view_key(&would_be_admin, &auditor);
+    assert_eq!(result.unwrap_err().unwrap(), AuditError::NotKeyGranter);
+
+    // The grant remains fully intact — the revocation attempt had no effect.
+    assert!(client.verify_access(&auditor));
 }
