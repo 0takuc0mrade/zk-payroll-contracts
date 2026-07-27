@@ -1,5 +1,6 @@
 #![no_std]
 
+use pause_manager::PauseManagerClient;
 use soroban_sdk::{contract, contractimpl, contracttype, Address, BytesN, Env, Symbol, Vec};
 
 // ---------------------------------------------------------------------------
@@ -47,6 +48,15 @@ pub struct CommitmentSnapshot {
     pub rotated_at: u64,
 }
 
+/// Pending two-step role-rotation request (issue #192).
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct PendingRotation {
+    pub new_holder: Address,
+    pub proposed_by: Address,
+    pub proposed_at: u64,
+}
+
     /// Storage keys
 #[contracttype]
 pub enum DataKey {
@@ -67,6 +77,10 @@ pub enum DataKey {
     /// Set by the admin via `lock_commitment_updates` and cleared via
     /// `unlock_commitment_updates`.
     CommitmentLock(Address),
+    /// Pause manager address (issue #193).
+    PauseManager,
+    /// Pending admin rotation proposal (issue #192).
+    PendingAdminRotation,
 }
 
 #[contract]
@@ -87,6 +101,7 @@ impl SalaryCommitmentContract {
     /// Set a delegated payroll operator that may record nullifiers
     /// (required for batch payroll execution). Only the admin may call.
     pub fn set_payroll_operator(env: Env, operator: Address) {
+        Self::require_not_paused(&env);
         Self::require_admin(&env);
         env.storage()
             .persistent()
@@ -101,6 +116,7 @@ impl SalaryCommitmentContract {
     /// payroll run is executed, ensuring the commitment cannot be silently
     /// altered after approval or audit review.
     pub fn lock_commitment_updates(env: Env, employee: Address) {
+        Self::require_not_paused(&env);
         Self::require_admin_or_operator(&env);
         let key = DataKey::CommitmentLock(employee.clone());
         if env.storage().persistent().has(&key) {
@@ -117,6 +133,7 @@ impl SalaryCommitmentContract {
     /// Unlock an employee's commitment so it can be updated again.
     /// Only the HR admin may call.
     pub fn unlock_commitment_updates(env: Env, employee: Address) {
+        Self::require_not_paused(&env);
         Self::require_admin(&env);
         let key = DataKey::CommitmentLock(employee.clone());
         if !env.storage().persistent().has(&key) {
@@ -156,6 +173,7 @@ impl SalaryCommitmentContract {
         employee: Address,
         commitment: BytesN<32>,
     ) -> SalaryCommitment {
+        Self::require_not_paused(&env);
         Self::require_admin(&env);
 
         let timestamp = env.ledger().timestamp();
@@ -196,6 +214,7 @@ impl SalaryCommitmentContract {
         employee: Address,
         new_commitment: BytesN<32>,
     ) -> SalaryCommitment {
+        Self::require_not_paused(&env);
         Self::require_admin(&env);
 
         if Self::is_commitment_locked(env.clone(), employee.clone()) {
@@ -244,6 +263,7 @@ impl SalaryCommitmentContract {
         employee: Address,
         new_commitment: BytesN<32>,
     ) -> SalaryCommitment {
+        Self::require_not_paused(&env);
         Self::require_admin(&env);
 
         if Self::is_commitment_locked(env.clone(), employee.clone()) {
@@ -333,6 +353,7 @@ impl SalaryCommitmentContract {
         employee: Address,
         reference_id: soroban_sdk::String,
     ) {
+        Self::require_not_paused(&env);
         Self::require_admin(&env);
 
         // Validate reference ID is not empty and reasonable length (< 256 chars)
@@ -396,6 +417,7 @@ impl SalaryCommitmentContract {
     /// Record a payment nullifier (prevents double payment).
     /// Authorized for both the HR admin and the delegated payroll operator.
     pub fn record_nullifier(env: Env, nullifier: BytesN<32>) {
+        Self::require_not_paused(&env);
         Self::require_admin_or_operator(&env);
 
         let key = DataKey::Nullifier(nullifier.clone());
@@ -472,6 +494,122 @@ impl SalaryCommitmentContract {
     // -----------------------------------------------------------------------
     // Internal helpers
     // -----------------------------------------------------------------------
+
+    // ── Issue #192: two-step admin rotation ──────────────────────────────────
+
+    /// Propose a new admin (step 1 of 2).
+    pub fn propose_admin_rotation(env: Env, current_admin: Address, new_admin: Address) {
+        Self::require_not_paused(&env);
+        let stored: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        if current_admin != stored {
+            panic!("Unauthorized: caller is not the current admin");
+        }
+        current_admin.require_auth();
+
+        if env.storage().persistent().has(&DataKey::PendingAdminRotation) {
+            panic!("A pending admin rotation already exists");
+        }
+
+        let proposal = PendingRotation {
+            new_holder: new_admin.clone(),
+            proposed_by: current_admin.clone(),
+            proposed_at: env.ledger().timestamp(),
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::PendingAdminRotation, &proposal);
+
+        env.events().publish(
+            (Symbol::new(&env, "AdminRotationProposed"), current_admin),
+            (new_admin,),
+        );
+    }
+
+    /// Accept a pending admin rotation (step 2 of 2).
+    pub fn accept_admin_rotation(env: Env, new_admin: Address) {
+        Self::require_not_paused(&env);
+        let proposal: PendingRotation = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PendingAdminRotation)
+            .expect("No pending admin rotation");
+
+        if new_admin != proposal.new_holder {
+            panic!("Unauthorized: caller is not the proposed admin");
+        }
+        new_admin.require_auth();
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Admin, &new_admin);
+        env.storage()
+            .persistent()
+            .remove(&DataKey::PendingAdminRotation);
+
+        env.events().publish(
+            (Symbol::new(&env, "AdminRotationAccepted"), new_admin),
+            (),
+        );
+    }
+
+    /// Cancel a pending admin rotation proposal.
+    pub fn cancel_admin_rotation(env: Env, current_admin: Address) {
+        Self::require_not_paused(&env);
+        let stored: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        if current_admin != stored {
+            panic!("Unauthorized");
+        }
+        current_admin.require_auth();
+
+        if !env.storage().persistent().has(&DataKey::PendingAdminRotation) {
+            panic!("No pending admin rotation to cancel");
+        }
+        env.storage()
+            .persistent()
+            .remove(&DataKey::PendingAdminRotation);
+
+        env.events().publish(
+            (Symbol::new(&env, "AdminRotationCancelled"), current_admin),
+            (),
+        );
+    }
+
+    /// Get the pending admin rotation proposal, if any.
+    pub fn get_pending_admin_rotation(env: Env) -> Option<PendingRotation> {
+        env.storage().persistent().get(&DataKey::PendingAdminRotation)
+    }
+
+    // ── Issue #193: pause support ────────────────────────────────────────────
+
+    /// Set the pause manager contract address (only admin).
+    pub fn set_pause_manager(env: Env, pause_manager: Address) {
+        Self::require_admin(&env);
+        env.storage()
+            .persistent()
+            .set(&DataKey::PauseManager, &pause_manager);
+    }
+
+    fn require_not_paused(env: &Env) {
+        if env.storage().persistent().has(&DataKey::PauseManager) {
+            let pm_addr: Address = env
+                .storage()
+                .persistent()
+                .get(&DataKey::PauseManager)
+                .unwrap();
+            let pm_client = PauseManagerClient::new(env, &pm_addr);
+            if pm_client.is_paused() {
+                panic!("Salary commitment operations are paused");
+            }
+        }
+    }
 
     fn archive_commitment(env: &Env, employee: &Address, commitment: &BytesN<32>, version: u32) {
         let mut idx: u32 = 0;
