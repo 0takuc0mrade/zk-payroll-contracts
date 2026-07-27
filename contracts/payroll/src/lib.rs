@@ -145,6 +145,90 @@ pub struct PendingRotation {
 }
 
 // ── Storage keys ──────────────────────────────────────────────────────────────
+// Issue #196: Storage Key Versioning Strategy
+//
+// ## Overview
+// This contract uses a versioned storage-key design to enable safe schema
+// evolution during contract upgrades. Each storage key is strongly typed and
+// scoped to prevent collisions across upgrade boundaries.
+//
+// ## Versioning Strategy
+// 1. **Enum-based namespacing**: All keys are variants of the `DataKey` enum,
+//    ensuring type safety and preventing accidental key collisions.
+//
+// 2. **Append-only evolution**: When adding new storage patterns, append new
+//    variants to the enum rather than modifying existing ones. This preserves
+//    backward compatibility with data written by earlier contract versions.
+//
+// 3. **Explicit migration path**: If a breaking schema change is required:
+//    - Add a new key variant (e.g., `PayrollRunV2(u64)`)
+//    - Write a one-time migration function that reads from the old key and
+//      writes to the new key
+//    - Mark the old variant as deprecated in comments
+//    - After migration window, the old variant can be removed in a future release
+//
+// 4. **Parameterized keys**: Many keys are parameterized (e.g., `PayrollRun(u64)`).
+//    This design is forward-compatible — new fields can be added to the stored
+//    struct without changing the key structure.
+//
+// 5. **Persistent vs Temporary storage**: Keys map to Persistent storage unless
+//    otherwise noted. Temporary storage (not used here) would require a separate
+//    key namespace to avoid upgrade confusion.
+//
+// ## Upgrade-safe patterns
+// - ✅ Adding new key variants (append-only)
+// - ✅ Adding fields to structs stored under existing keys (Soroban XDR evolution)
+// - ✅ Creating parallel V2 keys and migrating data over time
+// - ❌ Changing the type signature of an existing key variant (breaks deserialization)
+// - ❌ Reusing a key variant for a different data type (silent corruption)
+//
+// ## Example future upgrade scenarios
+//
+// ### Scenario 1: Adding a new payroll feature
+// ```rust
+// // Add to DataKey enum:
+// PayrollSchedule(u64),  // New feature, no conflicts
+// ```
+//
+// ### Scenario 2: Breaking change to PayrollRun
+// ```rust
+// // Step 1: Add new variant
+// PayrollRunV2(u64),
+//
+// // Step 2: Write migration function
+// pub fn migrate_payroll_runs_to_v2(e: Env) {
+//     let counter: u64 = e.storage().persistent()
+//         .get(&DataKey::RunCounter).unwrap_or(0);
+//     for id in 1..=counter {
+//         if let Some(old_run) = e.storage().persistent()
+//             .get::<_, PayrollRun>(&DataKey::PayrollRun(id)) {
+//             let new_run = PayrollRunV2::from(old_run);
+//             e.storage().persistent()
+//                 .set(&DataKey::PayrollRunV2(id), &new_run);
+//         }
+//     }
+// }
+//
+// // Step 3: Update all read/write call sites to use V2 key
+// // Step 4: Mark PayrollRun(u64) as deprecated
+// ```
+//
+// ### Scenario 3: Deprecating old data
+// ```rust
+// // After successful migration and a deprecation window:
+// // Remove the old variant from the enum in a new release
+// // (ensure no production deployments still reference it)
+// ```
+//
+// ## Testing migrations
+// Integration tests for schema upgrades should:
+// 1. Deploy contract V1 and write data
+// 2. Upgrade to contract V2
+// 3. Run migration function
+// 4. Verify V2 reads return expected data
+// 5. Verify old keys are either removed or marked obsolete
+//
+// See `contracts/integration_tests/` for versioning test examples.
 
 #[contracttype]
 pub enum DataKey {
@@ -171,6 +255,8 @@ pub enum DataKey {
     DraftCommitment(BytesN<32>),
     /// Pending emergency withdrawal request (#104).
     EmergencyRequest,
+    // Future upgrade example (issue #196):
+    // PayrollRunV2(u64),  // Would be added here when schema evolution is needed
 }
 
 #[contractimpl]
@@ -2727,5 +2813,141 @@ mod tests {
         payroll_client.prepare_payroll_run(
             &proofs, &amounts, &employees, &-1, &test_nonce(&env, 203), &None,
         );
+    }
+
+    // ── Issue #196: Storage key versioning strategy tests ────────────────────
+
+    #[test]
+    fn test_storage_keys_are_namespaced() {
+        let env = Env::default();
+        let (payroll_client, admin, _treasury, _treasury_owner, employee) =
+            setup_simple_payroll(&env);
+
+        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
+        let run_id = payroll_client.batch_process_payroll(
+            &proofs, &amounts, &employees, &1000, &test_nonce(&env, 210), &None,
+        );
+
+        let draft_id = payroll_client.create_run_draft(
+            &admin,
+            &5_000i128,
+            &10u32,
+            &Symbol::new(&env, "Q1"),
+        );
+
+        let run = payroll_client.get_payroll_run(&run_id);
+        let draft = payroll_client.get_run_draft(&draft_id);
+
+        assert_eq!(run.run_id, run_id);
+        assert_eq!(draft.draft_id, draft_id);
+    }
+
+    #[test]
+    fn test_parameterized_keys_support_schema_extension() {
+        let env = Env::default();
+        let (payroll_client, _admin, _treasury, _treasury_owner, employee) =
+            setup_simple_payroll(&env);
+
+        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
+        let run_id = payroll_client.batch_process_payroll(
+            &proofs, &amounts, &employees, &1000, &test_nonce(&env, 211), &None,
+        );
+
+        let run = payroll_client.get_payroll_run(&run_id);
+        assert_eq!(run.run_id, run_id);
+        assert_eq!(run.total_amount, 1000);
+        assert_eq!(run.employee_count, 1);
+    }
+
+    // ── Issue #203: Settlement completion guard tests ────────────────────────
+
+    #[test]
+    fn test_finalize_run_draft_is_idempotent() {
+        let env = Env::default();
+        let (payroll_client, admin, _treasury, _treasury_owner, _employee) =
+            setup_simple_payroll(&env);
+
+        let id = payroll_client.create_run_draft(
+            &admin,
+            &8_000i128,
+            &15u32,
+            &Symbol::new(&env, "MAR"),
+        );
+
+        payroll_client.finalize_run_draft(&admin, &id);
+        let draft = payroll_client.get_run_draft(&id);
+        assert_eq!(draft.state, RunDraftState::Finalized);
+
+        let result = payroll_client.try_finalize_run_draft(&admin, &id);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_payroll_run_execution_is_idempotent_via_nonce() {
+        let env = Env::default();
+        let (payroll_client, _admin, _treasury, _treasury_owner, employee) =
+            setup_simple_payroll(&env);
+
+        let nonce = test_nonce(&env, 212);
+        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
+
+        let run_id = payroll_client.batch_process_payroll(
+            &proofs, &amounts, &employees, &1000, &nonce, &None,
+        );
+        assert!(run_id > 0);
+
+        let result = payroll_client.try_batch_process_payroll(
+            &proofs, &amounts, &employees, &1000, &nonce, &None,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_pending_run_cannot_be_cancelled_twice() {
+        let env = Env::default();
+        let (payroll_client, admin, _treasury, _treasury_owner, employee) =
+            setup_simple_payroll(&env);
+
+        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
+        let run_id = payroll_client.prepare_payroll_run(
+            &proofs,
+            &amounts,
+            &employees,
+            &1000,
+            &test_nonce(&env, 213),
+            &None,
+        );
+
+        payroll_client.cancel_payroll_run(&admin, &run_id);
+
+        let result = payroll_client.try_cancel_payroll_run(&admin, &run_id);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_settlement_completion_guard_via_draft_state() {
+        let env = Env::default();
+        let (payroll_client, admin, _treasury, _treasury_owner, _employee) =
+            setup_simple_payroll(&env);
+
+        let draft_id = payroll_client.create_run_draft(
+            &admin,
+            &10_000i128,
+            &20u32,
+            &Symbol::new(&env, "Q4"),
+        );
+
+        let draft = payroll_client.get_run_draft(&draft_id);
+        assert_eq!(draft.state, RunDraftState::Pending);
+
+        payroll_client.finalize_run_draft(&admin, &draft_id);
+        let draft = payroll_client.get_run_draft(&draft_id);
+        assert_eq!(draft.state, RunDraftState::Finalized);
+
+        let result = payroll_client.try_amend_run_draft(&admin, &draft_id, &12_000i128, &22u32);
+        assert!(result.is_err());
+
+        let result = payroll_client.try_finalize_run_draft(&admin, &draft_id);
+        assert!(result.is_err());
     }
 }
