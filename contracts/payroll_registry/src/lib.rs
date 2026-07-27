@@ -176,6 +176,7 @@ impl PayrollRegistry {
 #[contractimpl]
 impl PayrollRegistryTrait for PayrollRegistry {
     fn register_company(env: Env, admin: Address, treasury: Address) -> u64 {
+        Self::require_not_paused(&env);
         admin.require_auth();
 
         if env
@@ -363,6 +364,7 @@ impl PayrollRegistryTrait for PayrollRegistry {
         current_admin: Address,
         new_admin: Address,
     ) {
+        Self::require_not_paused(&env);
         let info: CompanyInfo = env
             .storage()
             .persistent()
@@ -392,6 +394,7 @@ impl PayrollRegistryTrait for PayrollRegistry {
     }
 
     fn accept_admin_rotation(env: Env, company_id: u64, new_admin: Address) {
+        Self::require_not_paused(&env);
         let proposal: PendingCompanyRotation = env
             .storage()
             .persistent()
@@ -427,6 +430,7 @@ impl PayrollRegistryTrait for PayrollRegistry {
     }
 
     fn cancel_admin_rotation(env: Env, company_id: u64, current_admin: Address) {
+        Self::require_not_paused(&env);
         let info: CompanyInfo = env
             .storage()
             .persistent()
@@ -455,6 +459,7 @@ impl PayrollRegistryTrait for PayrollRegistry {
         current_admin: Address,
         new_treasury: Address,
     ) {
+        Self::require_not_paused(&env);
         let info: CompanyInfo = env
             .storage()
             .persistent()
@@ -484,6 +489,7 @@ impl PayrollRegistryTrait for PayrollRegistry {
     }
 
     fn accept_treasury_rotation(env: Env, company_id: u64, new_treasury: Address) {
+        Self::require_not_paused(&env);
         let proposal: PendingCompanyRotation = env
             .storage()
             .persistent()
