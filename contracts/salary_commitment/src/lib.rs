@@ -6,12 +6,12 @@ use soroban_sdk::{contract, contractimpl, contracttype, Address, BytesN, Env, Sy
 // Operational roles
 //
 // The salary commitment contract separates four operational roles:
-//   HR_ADMIN    — Registered in `initialize()`. Authorizes all writes
+//   HR_ADMIN    â€” Registered in `initialize()`. Authorizes all writes
 //                 (store / update / revoke commitment, record nullifier).
-//   PAYROLL_OP  — An address delegated to execute payroll (record nullifiers
+//   PAYROLL_OP  â€” An address delegated to execute payroll (record nullifiers
 //                 only). Set via `set_payroll_operator`.
-//   AUDITOR     — Grant access via the audit_module (view keys).
-//   TREASURY    — Does NOT interact with this contract; payment source lives
+//   AUDITOR     â€” Grant access via the audit_module (view keys).
+//   TREASURY    â€” Does NOT interact with this contract; payment source lives
 //                 in payment_executor.
 //
 // Unauthorized role actions fail with `require_auth()` / explicit role checks.
@@ -656,13 +656,13 @@ mod tests {
         let admin = Address::generate(&env);
         client.init_commitment_admin(&admin);
 
-        // No mock_auths — store_commitment should require admin auth and panic
+        // No mock_auths â€” store_commitment should require admin auth and panic
         let employee = Address::generate(&env);
         let commitment = BytesN::from_array(&env, &[99u8; 32]);
         client.store_commitment(&employee, &commitment);
     }
 
-    // ── Issue #171: admin / payroll-operator role-separation tests ───────────
+    // â”€â”€ Issue #171: admin / payroll-operator role-separation tests â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     /// Role separation: a delegated payroll operator may record nullifiers
     /// but must not be able to perform admin-only writes such as storing a
@@ -684,7 +684,7 @@ mod tests {
         let employee = Address::generate(&env);
         let commitment = BytesN::from_array(&env, &[1u8; 32]);
 
-        // Narrow auth to exactly the operator signing this call — the
+        // Narrow auth to exactly the operator signing this call â€” the
         // operator role must not satisfy the admin-only guard.
         env.mock_auths(&[soroban_sdk::testutils::MockAuth {
             address: &operator,
@@ -700,7 +700,7 @@ mod tests {
 
     /// Once a payroll operator is delegated, `record_nullifier` only
     /// accepts the operator's own signature (see `require_admin_or_operator`)
-    /// — the admin who delegated the role can no longer authorize this call
+    /// â€” the admin who delegated the role can no longer authorize this call
     /// directly. This is a real, non-obvious role-separation property worth
     /// locking in: delegating the payroll-operator role *transfers* this
     /// privilege rather than merely adding a second authorized signer.
@@ -732,7 +732,7 @@ mod tests {
         client.record_nullifier(&nullifier);
     }
 
-    // ── Issue #178: commitment update restrictions ──────────────────────────
+    // â”€â”€ Issue #178: commitment update restrictions â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn test_lock_commitment_updates_prevents_update() {
@@ -873,5 +873,117 @@ mod tests {
             },
         }]);
         client.record_nullifier(&nullifier);
+    }
+
+    // ── Issue #190: treasury / auditor role-separation tests ────────────
+    /// A treasury-role address (holds company funds per `payroll_registry`,
+    /// see `CompanyInfo.treasury`) has no admin authority in this contract.
+    /// Treasury never interacts with `salary_commitment` at all — it must
+    /// not be able to write a salary commitment just because it happens to
+    /// be a known, funded address in the system.
+    #[test]
+    #[should_panic(expected = "authorized")]
+    fn test_treasury_role_cannot_store_commitment() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, SalaryCommitmentContract);
+        let client = SalaryCommitmentContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        client.init_commitment_admin(&admin);
+        // Represents the company's treasury address (as registered via
+        // `payroll_registry::register_company(admin, treasury)`).
+        let treasury = Address::generate(&env);
+        let employee = Address::generate(&env);
+        let commitment = BytesN::from_array(&env, &[3u8; 32]);
+        // Narrow auth to exactly the treasury address signing this call —
+        // the treasury role must not satisfy the admin-only guard.
+        env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &treasury,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "store_commitment",
+                args: (employee.clone(), commitment.clone()).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.store_commitment(&employee, &commitment);
+    }
+    /// A treasury-role address must not be able to delegate the
+    /// payroll-operator role — that is an admin-only responsibility, and
+    /// treasury has no write access to this contract's role assignments.
+    #[test]
+    #[should_panic(expected = "authorized")]
+    fn test_treasury_role_cannot_set_payroll_operator() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, SalaryCommitmentContract);
+        let client = SalaryCommitmentContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        client.init_commitment_admin(&admin);
+        let treasury = Address::generate(&env);
+        let operator = Address::generate(&env);
+        env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &treasury,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "set_payroll_operator",
+                args: (operator.clone(),).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.set_payroll_operator(&operator);
+    }
+    /// An auditor-role address (view-only access via `audit_module`) must
+    /// not be able to record payment nullifiers — that is a payroll
+    /// execution privilege, and read access to audit data must never imply
+    /// write access to payroll execution state.
+    #[test]
+    #[should_panic(expected = "authorized")]
+    fn test_auditor_role_cannot_record_nullifier() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, SalaryCommitmentContract);
+        let client = SalaryCommitmentContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        client.init_commitment_admin(&admin);
+        // Represents an address holding a valid audit_module view key —
+        // read access only, never a payroll-execution role in this contract.
+        let auditor = Address::generate(&env);
+        let nullifier = BytesN::from_array(&env, &[4u8; 32]);
+        env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &auditor,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "record_nullifier",
+                args: (nullifier.clone(),).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.record_nullifier(&nullifier);
+    }
+    /// An auditor-role address must not be able to delegate the
+    /// payroll-operator role — audit access is strictly read-only and must
+    /// never grant the ability to assign write-capable roles.
+    #[test]
+    #[should_panic(expected = "authorized")]
+    fn test_auditor_role_cannot_set_payroll_operator() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, SalaryCommitmentContract);
+        let client = SalaryCommitmentContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        client.init_commitment_admin(&admin);
+        let auditor = Address::generate(&env);
+        let operator = Address::generate(&env);
+        env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &auditor,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "set_payroll_operator",
+                args: (operator.clone(),).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.set_payroll_operator(&operator);
     }
 }
