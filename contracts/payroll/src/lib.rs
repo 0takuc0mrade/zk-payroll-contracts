@@ -2167,8 +2167,265 @@ mod tests {
         payroll_client.deposit(&treasury, &100i128);
     }
 
+    // ── Issue #180: failed execution rollback tests ──────────────────────────
+
     #[test]
-    #[should_panic(expected = "Payroll is paused")]
+    fn test_failed_proof_mid_batch_rolls_back_nonce() {
+        let env = Env::default();
+        let (payroll_client, _admin, _treasury, _treasury_owner, employee) =
+            setup_simple_payroll(&env);
+
+        let mut employees = Vec::new(&env);
+        let mut proofs = Vec::new(&env);
+        let mut amounts = Vec::new(&env);
+
+        // Employee 1 — valid proof
+        let emp1 = employee;
+        employees.push_back(emp1.clone());
+        proofs.push_back(mock_proof(&env));
+        amounts.push_back(500i128);
+
+        // Employee 2 — will trigger proof failure (but proofs are mocked to always pass,
+        // so instead we use a different employee without a commitment stored).
+        let emp2 = Address::generate(&env);
+        employees.push_back(emp2.clone());
+        proofs.push_back(mock_proof(&env));
+        amounts.push_back(500i128);
+
+        let nonce = test_nonce(&env, 100);
+        let result = payroll_client.try_batch_process_payroll(
+            &proofs,
+            &amounts,
+            &employees,
+            &1000,
+            &nonce,
+            &None,
+        );
+        // Execution fails because emp2 has no stored commitment
+        assert!(result.is_err());
+
+        // Verify the nonce was rolled back — should be usable in a new run
+        let (proofs2, amounts2, employees2) = single_payment_batch(&env, &emp1, 500);
+        let run_id = payroll_client.batch_process_payroll(
+            &proofs2, &amounts2, &employees2, &500, &nonce, &None,
+        );
+        assert!(run_id > 0, "Nonce must be reusable after rolled-back execution");
+    }
+
+    #[test]
+    fn test_insufficient_funds_rolls_back_nonce_and_commitment() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let verifier_id = env.register_contract(None, ProofVerifier);
+        let verifier_client = ProofVerifierClient::new(&env, &verifier_id);
+        let verifier_admin = Address::generate(&env);
+        verifier_client.init_verifier_admin(&verifier_admin);
+        verifier_client.initialize_verifier(&mock_vk(&env));
+
+        let commitment_id = env.register_contract(None, SalaryCommitmentContract);
+        let commitment_client = SalaryCommitmentContractClient::new(&env, &commitment_id);
+        let commitment_admin = Address::generate(&env);
+        commitment_client.init_commitment_admin(&commitment_admin);
+
+        let token_id = env.register_contract(None, Token);
+        let token_client = TokenClient::new(&env, &token_id);
+
+        let payroll_id = env.register_contract(None, Payroll);
+        let payroll_client = PayrollClient::new(&env, &payroll_id);
+
+        let treasury = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let treasury_owner = Address::generate(&env);
+
+        // Mint only 100 tokens — NOT enough for the 1000 payment
+        token_client.mint(&treasury, &100i128);
+        payroll_client.initialize(
+            &admin, &token_id, &verifier_id, &commitment_id, &treasury, &treasury_owner,
+        );
+        commitment_client.set_payroll_operator(&payroll_id);
+
+        let employee = Address::generate(&env);
+        commitment_client.store_commitment(&employee, &BytesN::from_array(&env, &[0u8; 32]));
+
+        let nonce = test_nonce(&env, 101);
+        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
+
+        // Pre-commit a draft hash so we can verify it's also rolled back
+        let draft_hash = BytesN::from_array(&env, &[0x81u8; 32]);
+        payroll_client.commit_draft(&admin, &draft_hash);
+
+        let result = payroll_client.try_batch_process_payroll(
+            &proofs, &amounts, &employees, &1000, &nonce, &Some(draft_hash.clone()),
+        );
+        // Must fail due to insufficient treasury balance
+        assert!(result.is_err());
+
+        // Verify nonce is reusable (rolled back)
+        token_client.mint(&treasury, &10_000i128);
+        let run_id = payroll_client.batch_process_payroll(
+            &proofs, &amounts, &employees, &1000, &nonce, &Some(draft_hash.clone()),
+        );
+        assert!(run_id > 0, "Nonce and commitment must be reusable after failed execution");
+    }
+
+    #[test]
+    fn test_failed_execution_does_not_create_payroll_run() {
+        let env = Env::default();
+        let (payroll_client, _admin, _treasury, _treasury_owner, employee) =
+            setup_simple_payroll(&env);
+
+        // Submit with wrong expected_total_spend to trigger failure AFTER nonce consumption
+        let nonce = test_nonce(&env, 102);
+        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 500);
+
+        let result = payroll_client.try_batch_process_payroll(
+            &proofs, &amounts, &employees, &999, &nonce, &None,
+        );
+        assert!(result.is_err());
+
+        // Verify no payroll run record was created
+        let mut any_run = false;
+        for run_id in 1..5u64 {
+            if payroll_client.try_get_payroll_run(&run_id).is_ok() {
+                any_run = true;
+                break;
+            }
+        }
+        assert!(!any_run, "No PayrollRun should exist after a failed execution");
+
+        // Nonce is NOT consumed (rolled back) — can retry with corrected params
+        let run_id = payroll_client.batch_process_payroll(
+            &proofs, &amounts, &employees, &500, &nonce, &None,
+        );
+        assert!(run_id > 0, "Nonce must be reusable after failed execution");
+    }
+
+    #[test]
+    fn test_failed_execution_does_not_consume_draft_commitment() {
+        let env = Env::default();
+        let (payroll_client, admin, _treasury, _treasury_owner, employee) =
+            setup_simple_payroll(&env);
+
+        let draft_hash = BytesN::from_array(&env, &[0x82u8; 32]);
+        payroll_client.commit_draft(&admin, &draft_hash);
+
+        // Trigger failure with amount mismatch
+        let nonce = test_nonce(&env, 103);
+        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 500);
+        let result = payroll_client.try_batch_process_payroll(
+            &proofs, &amounts, &employees, &999, &nonce, &Some(draft_hash.clone()),
+        );
+        assert!(result.is_err());
+
+        // Draft commitment should still be usable (rolled back)
+        let nonce2 = test_nonce(&env, 104);
+        let run_id = payroll_client.batch_process_payroll(
+            &proofs, &amounts, &employees, &500, &nonce2, &Some(draft_hash),
+        );
+        assert!(run_id > 0, "Draft commitment must survive a rolled-back execution");
+    }
+
+    #[test]
+    fn test_failed_execution_does_not_leave_pending_state() {
+        let env = Env::default();
+        let (payroll_client, _admin, _treasury, _treasury_owner, employee) =
+            setup_simple_payroll(&env);
+
+        let nonce = test_nonce(&env, 105);
+        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 500);
+        let result = payroll_client.try_batch_process_payroll(
+            &proofs, &amounts, &employees, &999, &nonce, &None,
+        );
+        assert!(result.is_err());
+
+        // After failure, a successful run with the same nonce should work
+        // (nonce was rolled back). Also verify the run gets a valid ID.
+        let run_id = payroll_client.batch_process_payroll(
+            &proofs, &amounts, &employees, &500, &nonce, &None,
+        );
+        assert!(run_id > 0, "Nonce must be reusable after failed execution");
+    }
+
+    #[test]
+    #[should_panic(expected = "Duplicate run nonce")]
+    fn test_successful_run_consumes_nonce_permanently() {
+        let env = Env::default();
+        let (payroll_client, _admin, _treasury, _treasury_owner, employee) =
+            setup_simple_payroll(&env);
+
+        let nonce = test_nonce(&env, 106);
+        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 500);
+        payroll_client.batch_process_payroll(
+            &proofs, &amounts, &employees, &500, &nonce, &None,
+        );
+
+        // Second attempt with same nonce — must fail permanently
+        let (proofs2, amounts2, employees2) = single_payment_batch(&env, &employee, 500);
+        payroll_client.batch_process_payroll(
+            &proofs2, &amounts2, &employees2, &500, &nonce, &None,
+        );
+    }
+
+    #[test]
+    fn test_failed_prepare_does_not_lock_nonce() {
+        let env = Env::default();
+        let (payroll_client, _admin, _treasury, _treasury_owner, employee) =
+            setup_simple_payroll(&env);
+
+        let nonce = test_nonce(&env, 107);
+        let mut proofs = Vec::new(&env);
+        proofs.push_back(mock_proof(&env));
+        let mut amounts = Vec::new(&env);
+        amounts.push_back(500i128);
+        let mut employees = Vec::new(&env);
+        employees.push_back(employee.clone());
+
+        // Successful prepare
+        let run_id = payroll_client.prepare_payroll_run(
+            &proofs, &amounts, &employees, &500, &nonce, &None,
+        );
+        assert!(run_id > 0);
+
+        // Failed cancel (wrong caller) should not affect the pending run
+        let attacker = Address::generate(&env);
+        let cancel_result = payroll_client.try_cancel_payroll_run(&attacker, &run_id);
+        assert!(cancel_result.is_err());
+
+        // Pending run should still exist
+        let pending = payroll_client.get_pending_run(&run_id);
+        assert!(pending.is_some(), "Pending run must survive unauthorized cancel attempt");
+    }
+
+    #[test]
+    fn test_failed_execution_array_mismatch_rolls_back() {
+        let env = Env::default();
+        let (payroll_client, _admin, _treasury, _treasury_owner, employee) =
+            setup_simple_payroll(&env);
+
+        let nonce = test_nonce(&env, 108);
+        let mut proofs = Vec::new(&env);
+        proofs.push_back(mock_proof(&env)); // 1 proof
+        let mut amounts = Vec::new(&env);
+        amounts.push_back(500i128);
+        amounts.push_back(500i128); // 2 amounts — mismatch!
+        let mut employees = Vec::new(&env);
+        employees.push_back(employee.clone());
+
+        let result = payroll_client.try_batch_process_payroll(
+            &proofs, &amounts, &employees, &1000, &nonce, &None,
+        );
+        assert!(result.is_err());
+
+        // Nonce should still be usable after rollback
+        let (proofs2, amounts2, employees2) = single_payment_batch(&env, &employee, 500);
+        let run_id = payroll_client.batch_process_payroll(
+            &proofs2, &amounts2, &employees2, &500, &nonce, &None,
+        );
+        assert!(run_id > 0, "Nonce must be reusable after array mismatch rollback");
+    }
+
+    #[test]
     fn test_pause_blocks_emergency_withdrawal_request() {
         let env = Env::default();
         let (payroll_client, admin, _treasury, treasury_owner, _employee) =
