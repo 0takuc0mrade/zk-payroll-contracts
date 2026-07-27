@@ -662,6 +662,10 @@ impl Payroll {
 
             token_client.transfer(&addrs.treasury, &employee, &amount);
 
+            // #178 — lock the employee's commitment so it cannot be silently
+            // altered after payroll has been executed for this period.
+            commitment_client.lock_commitment_updates(&employee);
+
             e.events().publish(
                 (
                     symbol_short!("payroll"),
