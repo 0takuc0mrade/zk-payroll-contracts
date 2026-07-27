@@ -47,7 +47,7 @@ pub struct CommitmentSnapshot {
     pub rotated_at: u64,
 }
 
-/// Storage keys
+    /// Storage keys
 #[contracttype]
 pub enum DataKey {
     Commitment(Address),
@@ -63,6 +63,10 @@ pub enum DataKey {
     EmployeeReferenceId(Address),
     /// Reverse mapping to detect collisions (ref_id -> employee).
     ReferenceIdIndex(soroban_sdk::String),
+    /// When true, the employee's commitment is locked and cannot be updated.
+    /// Set by the admin via `lock_commitment_updates` and cleared via
+    /// `unlock_commitment_updates`.
+    CommitmentLock(Address),
 }
 
 #[contract]
@@ -87,6 +91,49 @@ impl SalaryCommitmentContract {
         env.storage()
             .persistent()
             .set(&DataKey::PayrollOperator, &operator);
+    }
+
+    /// Lock an employee's commitment to prevent updates via `update_commitment`
+    /// or `rotate_commitment`. Both the HR admin and the delegated payroll
+    /// operator may call.
+    ///
+    /// The lock is meant to be set when a payroll draft is finalized or a
+    /// payroll run is executed, ensuring the commitment cannot be silently
+    /// altered after approval or audit review.
+    pub fn lock_commitment_updates(env: Env, employee: Address) {
+        Self::require_admin_or_operator(&env);
+        let key = DataKey::CommitmentLock(employee.clone());
+        if env.storage().persistent().has(&key) {
+            panic!("Commitment is already locked");
+        }
+        env.storage().persistent().set(&key, &true);
+
+        env.events().publish(
+            (Symbol::new(&env, "CommitmentLocked"), employee),
+            (),
+        );
+    }
+
+    /// Unlock an employee's commitment so it can be updated again.
+    /// Only the HR admin may call.
+    pub fn unlock_commitment_updates(env: Env, employee: Address) {
+        Self::require_admin(&env);
+        let key = DataKey::CommitmentLock(employee.clone());
+        if !env.storage().persistent().has(&key) {
+            panic!("Commitment is not locked");
+        }
+        env.storage().persistent().remove(&key);
+
+        env.events().publish(
+            (Symbol::new(&env, "CommitmentUnlocked"), employee),
+            (),
+        );
+    }
+
+    /// Check if an employee's commitment is currently locked.
+    pub fn is_commitment_locked(env: Env, employee: Address) -> bool {
+        let key = DataKey::CommitmentLock(employee);
+        env.storage().persistent().has(&key)
     }
 
     /// Get the stored admin address.
@@ -141,12 +188,19 @@ impl SalaryCommitmentContract {
     /// The previous commitment is archived in CommitmentHistory so it remains
     /// auditable. The new commitment replaces the active record and the version
     /// is incremented.
+    ///
+    /// Fails if the employee's commitment is currently locked (see
+    /// `lock_commitment_updates` / `unlock_commitment_updates`).
     pub fn update_commitment(
         env: Env,
         employee: Address,
         new_commitment: BytesN<32>,
     ) -> SalaryCommitment {
         Self::require_admin(&env);
+
+        if Self::is_commitment_locked(env.clone(), employee.clone()) {
+            panic!("Commitment is locked: cannot update until unlocked by admin");
+        }
 
         let key = DataKey::Commitment(employee.clone());
         let existing: SalaryCommitment = env
@@ -182,12 +236,19 @@ impl SalaryCommitmentContract {
     /// and store the new one. Old commitments CANNOT be used for future payroll
     /// proofs (see `is_commitment_active`).
     /// Only the HR admin may call.
+    ///
+    /// Fails if the employee's commitment is currently locked (see
+    /// `lock_commitment_updates` / `unlock_commitment_updates`).
     pub fn rotate_commitment(
         env: Env,
         employee: Address,
         new_commitment: BytesN<32>,
     ) -> SalaryCommitment {
         Self::require_admin(&env);
+
+        if Self::is_commitment_locked(env.clone(), employee.clone()) {
+            panic!("Commitment is locked: cannot rotate until unlocked by admin");
+        }
 
         let key = DataKey::Commitment(employee.clone());
         let mut existing: SalaryCommitment = env
@@ -669,6 +730,118 @@ mod tests {
             },
         }]);
         client.record_nullifier(&nullifier);
+    }
+
+    // ── Issue #178: commitment update restrictions ──────────────────────────
+
+    #[test]
+    fn test_lock_commitment_updates_prevents_update() {
+        let (env, contract_id, _admin) = setup_with_admin();
+        let client = SalaryCommitmentContractClient::new(&env, &contract_id);
+
+        let employee = Address::generate(&env);
+        let initial = BytesN::from_array(&env, &[10u8; 32]);
+        let replacement = BytesN::from_array(&env, &[20u8; 32]);
+
+        client.store_commitment(&employee, &initial);
+        client.lock_commitment_updates(&employee);
+
+        let result = client.try_update_commitment(&employee, &replacement);
+        assert!(result.is_err(), "Locked commitment must reject update");
+    }
+
+    #[test]
+    fn test_lock_commitment_updates_prevents_rotate() {
+        let (env, contract_id, _admin) = setup_with_admin();
+        let client = SalaryCommitmentContractClient::new(&env, &contract_id);
+
+        let employee = Address::generate(&env);
+        let initial = BytesN::from_array(&env, &[11u8; 32]);
+        let replacement = BytesN::from_array(&env, &[21u8; 32]);
+
+        client.store_commitment(&employee, &initial);
+        client.lock_commitment_updates(&employee);
+
+        let result = client.try_rotate_commitment(&employee, &replacement);
+        assert!(result.is_err(), "Locked commitment must reject rotation");
+    }
+
+    #[test]
+    fn test_unlock_commitment_allows_update_after_lock() {
+        let (env, contract_id, _admin) = setup_with_admin();
+        let client = SalaryCommitmentContractClient::new(&env, &contract_id);
+
+        let employee = Address::generate(&env);
+        let initial = BytesN::from_array(&env, &[12u8; 32]);
+        let replacement = BytesN::from_array(&env, &[22u8; 32]);
+
+        client.store_commitment(&employee, &initial);
+        client.lock_commitment_updates(&employee);
+        client.unlock_commitment_updates(&employee);
+
+        let result = client.update_commitment(&employee, &replacement);
+        assert_eq!(result.commitment, replacement);
+        assert_eq!(result.version, 2);
+    }
+
+    #[test]
+    fn test_is_commitment_locked_returns_correct_state() {
+        let (env, contract_id, _admin) = setup_with_admin();
+        let client = SalaryCommitmentContractClient::new(&env, &contract_id);
+
+        let employee = Address::generate(&env);
+        let commitment = BytesN::from_array(&env, &[13u8; 32]);
+        client.store_commitment(&employee, &commitment);
+
+        assert!(!client.is_commitment_locked(&employee));
+
+        client.lock_commitment_updates(&employee);
+        assert!(client.is_commitment_locked(&employee));
+
+        client.unlock_commitment_updates(&employee);
+        assert!(!client.is_commitment_locked(&employee));
+    }
+
+    #[test]
+    fn test_lock_commitment_twice_panics() {
+        let (env, contract_id, _admin) = setup_with_admin();
+        let client = SalaryCommitmentContractClient::new(&env, &contract_id);
+
+        let employee = Address::generate(&env);
+        let commitment = BytesN::from_array(&env, &[14u8; 32]);
+        client.store_commitment(&employee, &commitment);
+        client.lock_commitment_updates(&employee);
+
+        let result = client.try_lock_commitment_updates(&employee);
+        assert!(result.is_err(), "Double lock must fail");
+    }
+
+    #[test]
+    fn test_unlock_without_lock_panics() {
+        let (env, contract_id, _admin) = setup_with_admin();
+        let client = SalaryCommitmentContractClient::new(&env, &contract_id);
+
+        let employee = Address::generate(&env);
+        let result = client.try_unlock_commitment_updates(&employee);
+        assert!(result.is_err(), "Unlock without lock must fail");
+    }
+
+    #[test]
+    fn test_store_commitment_not_blocked_by_lock() {
+        let (env, contract_id, _admin) = setup_with_admin();
+        let client = SalaryCommitmentContractClient::new(&env, &contract_id);
+
+        let existing_emp = Address::generate(&env);
+        let new_emp = Address::generate(&env);
+        let cmt = BytesN::from_array(&env, &[15u8; 32]);
+
+        client.store_commitment(&existing_emp, &cmt);
+        client.lock_commitment_updates(&existing_emp);
+
+        // A new employee should still be able to get a commitment stored
+        let result = client.store_commitment(&new_emp, &cmt);
+        assert_eq!(result.version, 1);
+        assert_eq!(result.commitment, cmt);
     }
 
     /// A stranger who is neither the admin nor the delegated operator must

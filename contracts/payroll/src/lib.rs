@@ -57,6 +57,10 @@ pub struct PendingPayrollRun {
 /// gives auditors a stable reference to tie the execution back to the
 /// reviewed draft.
 ///
+/// `metadata_hash` is a SHA-256 hash of off-chain metadata (payroll period,
+/// company ID, employee batch, commitment references). It is validated against
+/// a pre-committed hash via `commit_metadata` and stored for audit (#177).
+///
 /// `nonce` is a caller-supplied, company-scoped uniqueness token (#103).
 /// Once used it can never be reused, preventing accidental duplicate runs.
 #[contracttype]
@@ -72,6 +76,8 @@ pub struct PayrollRun {
     /// Caller-supplied run nonce (issue #103). Unique per contract lifetime.
     pub nonce: BytesN<32>,
     pub reconciliation_status: ReconciliationStatus,
+    /// Off-chain metadata hash (period, company, batch, commitments) (#177).
+    pub metadata_hash: BytesN<32>,
 }
 
 /// Pending emergency withdrawal request (issue #104).
@@ -269,6 +275,75 @@ impl Payroll {
             .persistent()
             .get(&DataKey::PayrollRun(run_id))
             .expect("Run not found")
+    }
+
+    /// Pre-commit an off-chain metadata hash (SHA-256 of payroll period,
+    /// company ID, employee batch hash, and commitment references) that
+    /// will be bound to a payroll run during execution (#177).
+    ///
+    /// Only the admin may call. The commitment is one-time-use: once consumed
+    /// by `set_run_metadata` it is removed from storage.
+    pub fn commit_metadata_hash(e: Env, admin: Address, metadata_hash: BytesN<32>) {
+        let addrs: ContractAddresses = e
+            .storage()
+            .persistent()
+            .get(&DataKey::Addresses)
+            .expect("Not initialized");
+        if admin != addrs.admin {
+            panic!("Unauthorized");
+        }
+        admin.require_auth();
+
+        let key = DataKey::DraftCommitment(metadata_hash.clone());
+        if e.storage().persistent().has(&key) {
+            panic!("Metadata hash already committed");
+        }
+        e.storage().persistent().set(&key, &true);
+
+        e.events().publish(
+            (symbol_short!("payroll"), Symbol::new(&e, "meta_committed")),
+            metadata_hash,
+        );
+    }
+
+    /// Bound a pre-committed metadata hash to an existing payroll run.
+    /// Consumes the commitment so it cannot be reused. Only the admin may call.
+    ///
+    /// Must be called with a metadata hash that was previously committed via
+    /// `commit_metadata_hash`. Fails if the hash has not been pre-committed.
+    pub fn set_run_metadata(e: Env, admin: Address, run_id: u64, metadata_hash: BytesN<32>) {
+        let addrs: ContractAddresses = e
+            .storage()
+            .persistent()
+            .get(&DataKey::Addresses)
+            .expect("Not initialized");
+        if admin != addrs.admin {
+            panic!("Unauthorized");
+        }
+        admin.require_auth();
+
+        // Verify the metadata hash was pre-committed.
+        let commit_key = DataKey::DraftCommitment(metadata_hash.clone());
+        if !e.storage().persistent().has(&commit_key) {
+            panic!("Metadata hash not pre-committed: call commit_metadata_hash first");
+        }
+        // Consume the commitment.
+        e.storage().persistent().remove(&commit_key);
+
+        // Update the payroll run record.
+        let run_key = DataKey::PayrollRun(run_id);
+        let mut run: PayrollRun = e
+            .storage()
+            .persistent()
+            .get(&run_key)
+            .expect("Run not found");
+        run.metadata_hash = metadata_hash.clone();
+        e.storage().persistent().set(&run_key, &run);
+
+        e.events().publish(
+            (symbol_short!("payroll"), Symbol::new(&e, "meta_bound")),
+            (run_id, metadata_hash),
+        );
     }
 
     /// Pre-commit an off-chain draft hash so it can be bound to a future run.
@@ -662,6 +737,10 @@ impl Payroll {
 
             token_client.transfer(&addrs.treasury, &employee, &amount);
 
+            // #178 — lock the employee's commitment so it cannot be silently
+            // altered after payroll has been executed for this period.
+            commitment_client.lock_commitment_updates(&employee);
+
             e.events().publish(
                 (
                     symbol_short!("payroll"),
@@ -682,6 +761,7 @@ impl Payroll {
             draft_hash: resolved_draft_hash,
             nonce: nonce.clone(),
             reconciliation_status: ReconciliationStatus::Unreconciled,
+            metadata_hash: BytesN::from_array(&e, &[0u8; 32]),
         };
         e.storage()
             .persistent()
@@ -2088,6 +2168,84 @@ mod tests {
             setup_simple_payroll(&env);
 
         payroll_client.cancel_payroll_run(&admin, &999u64);
+    }
+
+    // ── Issue #177: payroll run metadata hash checks ──────────────────────────
+
+    #[test]
+    fn test_commit_metadata_hash_stores_commitment() {
+        let env = Env::default();
+        let (payroll_client, admin, _treasury, _treasury_owner, _employee) =
+            setup_simple_payroll(&env);
+
+        let meta_hash = BytesN::from_array(&env, &[0xaau8; 32]);
+        payroll_client.commit_metadata_hash(&admin, &meta_hash);
+
+        // Should not panic — commitment is stored.
+    }
+
+    #[test]
+    #[should_panic(expected = "Metadata hash already committed")]
+    fn test_commit_metadata_hash_twice_panics() {
+        let env = Env::default();
+        let (payroll_client, admin, _treasury, _treasury_owner, _employee) =
+            setup_simple_payroll(&env);
+
+        let meta_hash = BytesN::from_array(&env, &[0xbbu8; 32]);
+        payroll_client.commit_metadata_hash(&admin, &meta_hash);
+        payroll_client.commit_metadata_hash(&admin, &meta_hash);
+    }
+
+    #[test]
+    fn test_set_run_metadata_binds_hash_to_run() {
+        let env = Env::default();
+        let (payroll_client, admin, _treasury, _treasury_owner, employee) =
+            setup_simple_payroll(&env);
+
+        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
+        let run_id = payroll_client.batch_process_payroll(
+            &proofs, &amounts, &employees, &1000, &test_nonce(&env, 50), &None,
+        );
+        assert!(run_id > 0);
+
+        let meta_hash = BytesN::from_array(&env, &[0xccu8; 32]);
+        payroll_client.commit_metadata_hash(&admin, &meta_hash);
+        payroll_client.set_run_metadata(&admin, &run_id, &meta_hash);
+
+        let run = payroll_client.get_payroll_run(&run_id);
+        assert_eq!(run.metadata_hash, meta_hash);
+    }
+
+    #[test]
+    #[should_panic(expected = "Metadata hash not pre-committed")]
+    fn test_set_run_metadata_rejects_uncommitted_hash() {
+        let env = Env::default();
+        let (payroll_client, admin, _treasury, _treasury_owner, employee) =
+            setup_simple_payroll(&env);
+
+        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
+        let run_id = payroll_client.batch_process_payroll(
+            &proofs, &amounts, &employees, &1000, &test_nonce(&env, 51), &None,
+        );
+
+        let meta_hash = BytesN::from_array(&env, &[0xddu8; 32]);
+        payroll_client.set_run_metadata(&admin, &run_id, &meta_hash);
+    }
+
+    #[test]
+    fn test_run_metadata_hash_defaults_to_zero() {
+        let env = Env::default();
+        let (payroll_client, _admin, _treasury, _treasury_owner, employee) =
+            setup_simple_payroll(&env);
+
+        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
+        let run_id = payroll_client.batch_process_payroll(
+            &proofs, &amounts, &employees, &1000, &test_nonce(&env, 52), &None,
+        );
+
+        let run = payroll_client.get_payroll_run(&run_id);
+        let zero: BytesN<32> = BytesN::from_array(&env, &[0u8; 32]);
+        assert_eq!(run.metadata_hash, zero);
     }
 
     #[test]
