@@ -255,6 +255,8 @@ pub enum DataKey {
     DraftCommitment(BytesN<32>),
     /// Pending emergency withdrawal request (#104).
     EmergencyRequest,
+    /// Allowed assets for payroll payouts.
+    AllowedAsset(Address),
     // Future upgrade example (issue #196):
     // PayrollRunV2(u64),  // Would be added here when schema evolution is needed
 }
@@ -285,6 +287,9 @@ impl Payroll {
         e.storage().persistent().set(&key, &addrs);
         e.storage()
             .persistent()
+            .set(&DataKey::AllowedAsset(addrs.token.clone()), &true);
+        e.storage()
+            .persistent()
             .set(&DataKey::TreasuryOwner, &treasury_owner);
         e.storage().persistent().set(&DataKey::RunCounter, &0u64);
     }
@@ -313,6 +318,27 @@ impl Payroll {
         e.storage()
             .persistent()
             .set(&DataKey::PauseManager, &pause_manager);
+    }
+
+    /// Allow or disallow an asset token for payroll payouts.
+    pub fn set_asset_allowed(e: Env, asset: Address, allowed: bool) {
+        let addrs: ContractAddresses = e
+            .storage()
+            .persistent()
+            .get(&DataKey::Addresses)
+            .expect("Not initialized");
+        addrs.admin.require_auth();
+        e.storage()
+            .persistent()
+            .set(&DataKey::AllowedAsset(asset), &allowed);
+    }
+
+    /// Check if an asset token is allowlisted for payroll payouts.
+    pub fn is_asset_allowed(e: Env, asset: Address) -> bool {
+        e.storage()
+            .persistent()
+            .get(&DataKey::AllowedAsset(asset))
+            .unwrap_or(false)
     }
 
     pub fn deposit(e: Env, from: Address, amount: i128, deposit_id: BytesN<32>) {
@@ -667,6 +693,11 @@ impl Payroll {
 
         addrs.admin.require_auth();
 
+        // Validate treasury asset allowlist
+        if !Self::is_asset_allowed(e.clone(), addrs.token.clone()) {
+            panic!("Asset not allowed");
+        }
+
         let run_id = Self::derive_run_id(&e);
 
         // Mark nonce as consumed (store run_id for auditability).
@@ -792,6 +823,11 @@ impl Payroll {
             .persistent()
             .get(&DataKey::Addresses)
             .expect("Not initialized");
+
+        // Validate treasury asset allowlist
+        if !Self::is_asset_allowed(e.clone(), addrs.token.clone()) {
+            panic!("Asset not allowed");
+        }
 
         if e.storage().persistent().has(&DataKey::PauseManager) {
             let pm_addr: Address = e
@@ -2949,5 +2985,117 @@ mod tests {
 
         let result = payroll_client.try_finalize_run_draft(&admin, &draft_id);
         assert!(result.is_err());
+    }
+
+    // Issue #200: Asset allowlist enforcement tests
+    fn setup_payroll_with_token(env: &Env) -> (PayrollClient<'_>, Address, Address, Address, Address, Address) {
+        env.mock_all_auths();
+
+        let verifier_id = env.register_contract(None, ProofVerifier);
+        let verifier_client = ProofVerifierClient::new(env, &verifier_id);
+        let verifier_admin = Address::generate(env);
+        verifier_client.init_verifier_admin(&verifier_admin);
+        verifier_client.initialize_verifier(&mock_vk(env));
+
+        let commitment_id = env.register_contract(None, SalaryCommitmentContract);
+        let commitment_client = SalaryCommitmentContractClient::new(env, &commitment_id);
+        let commitment_admin = Address::generate(env);
+        commitment_client.init_commitment_admin(&commitment_admin);
+
+        let token_id = env.register_contract(None, Token);
+        let token_client = TokenClient::new(env, &token_id);
+
+        let payroll_id = env.register_contract(None, Payroll);
+        let payroll_client = PayrollClient::new(env, &payroll_id);
+
+        let treasury = Address::generate(env);
+        let admin = Address::generate(env);
+        let treasury_owner = Address::generate(env);
+        token_client.mint(&treasury, &1_000_000i128);
+        payroll_client.initialize(
+            &admin,
+            &token_id,
+            &verifier_id,
+            &commitment_id,
+            &treasury,
+            &treasury_owner,
+        );
+
+        commitment_client.set_payroll_operator(&payroll_id);
+
+        let employee = Address::generate(env);
+        commitment_client.store_commitment(&employee, &BytesN::from_array(env, &[0u8; 32]));
+
+        (payroll_client, admin, treasury, treasury_owner, employee, token_id)
+    }
+
+    #[test]
+    fn test_asset_allowlist_management_and_execution() {
+        let env = Env::default();
+        let (payroll_client, _admin, _treasury, _treasury_owner, _employee, token_id) =
+            setup_payroll_with_token(&env);
+
+        // Initial token asset is allowlisted
+        assert!(payroll_client.is_asset_allowed(&token_id));
+
+        // Disallow token asset
+        payroll_client.set_asset_allowed(&token_id, &false);
+        assert!(!payroll_client.is_asset_allowed(&token_id));
+
+        // Re-allow token asset
+        payroll_client.set_asset_allowed(&token_id, &true);
+        assert!(payroll_client.is_asset_allowed(&token_id));
+    }
+
+    #[test]
+    #[should_panic(expected = "Asset not allowed")]
+    fn test_execute_payroll_fails_when_asset_disallowed() {
+        let env = Env::default();
+        let (payroll_client, _admin, _treasury, _treasury_owner, employee, token_id) =
+            setup_payroll_with_token(&env);
+
+        // Disallow the payment token asset
+        payroll_client.set_asset_allowed(&token_id, &false);
+
+        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
+        payroll_client.batch_process_payroll(
+            &proofs, &amounts, &employees, &1000, &test_nonce(&env, 220), &None,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "Asset not allowed")]
+    fn test_prepare_payroll_run_fails_when_asset_disallowed() {
+        let env = Env::default();
+        let (payroll_client, _admin, _treasury, _treasury_owner, employee, token_id) =
+            setup_payroll_with_token(&env);
+
+        // Disallow the payment token asset
+        payroll_client.set_asset_allowed(&token_id, &false);
+
+        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
+        payroll_client.prepare_payroll_run(
+            &proofs, &amounts, &employees, &1000, &test_nonce(&env, 221), &None,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "authorized")]
+    fn test_non_admin_cannot_manage_allowlist() {
+        let env = Env::default();
+        let (payroll_client, _admin, _treasury, _treasury_owner, _employee, token_id) =
+            setup_payroll_with_token(&env);
+
+        let attacker = Address::generate(&env);
+        env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &attacker,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &payroll_client.address,
+                fn_name: "set_asset_allowed",
+                args: (token_id.clone(), false).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        payroll_client.set_asset_allowed(&token_id, &false);
     }
 }
