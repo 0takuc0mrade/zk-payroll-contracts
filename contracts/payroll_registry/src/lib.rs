@@ -328,9 +328,36 @@ impl PayrollRegistryTrait for PayrollRegistry {
             panic!("Employee not found");
         }
 
+        let previous_status: EmployeeStatus = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EmpStatus(company_id, employee.clone()))
+            .unwrap_or(EmployeeStatus::Incomplete);
+
+        if previous_status == status {
+            return;
+        }
+
         env.storage()
             .persistent()
-            .set(&DataKey::EmpStatus(company_id, employee), &status);
+            .set(&DataKey::EmpStatus(company_id, employee.clone()), &status);
+
+        let event_name = match status {
+            EmployeeStatus::Active => Symbol::new(&env, "EmployeeReactivated"),
+            EmployeeStatus::Inactive => Symbol::new(&env, "EmployeeDeactivated"),
+            EmployeeStatus::Incomplete => Symbol::new(&env, "EmployeeStatusUpdated"),
+        };
+        env.events().publish(
+            (event_name, company_id, employee),
+            (
+                previous_status,
+                status,
+                env.ledger().sequence(),
+                env.ledger().timestamp(),
+            ),
+        );
+        // topics : ("EmployeeDeactivated" | "EmployeeReactivated" | "EmployeeStatusUpdated", company_id, employee)
+        // data   : (previous_status, new_status, ledger_sequence, timestamp)
     }
 
     fn get_employee_status(env: Env, company_id: u64, employee: Address) -> EmployeeStatus {
