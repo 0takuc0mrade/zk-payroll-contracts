@@ -1,6 +1,7 @@
 #![no_std]
 
 use pause_manager::PauseManagerClient;
+use payroll_events;
 use soroban_sdk::{contract, contractimpl, contracttype, Address, BytesN, Env, Symbol};
 
 // ---------------------------------------------------------------------------
@@ -170,6 +171,7 @@ impl PayrollRegistry {
         env.storage()
             .persistent()
             .set(&DataKey::PauseManager, &pause_manager);
+        payroll_events::emit_registry_pause_manager_set(&env, pause_manager);
     }
 }
 
@@ -207,12 +209,7 @@ impl PayrollRegistryTrait for PayrollRegistry {
             .persistent()
             .set(&DataKey::CompanyAdmin(admin.clone()), &id);
 
-        env.events().publish(
-            (Symbol::new(&env, "CompanyRegistered"), id),
-            (admin, treasury),
-        );
-        // topics : ("CompanyRegistered", company_id)
-        // data   : (admin, treasury)
+        payroll_events::emit_company_registered(&env, id, admin, treasury);
 
         id
     }
@@ -238,12 +235,7 @@ impl PayrollRegistryTrait for PayrollRegistry {
             &EmployeeStatus::Active,
         );
 
-        env.events().publish(
-            (Symbol::new(&env, "EmployeeAdded"), company_id, employee),
-            (commitment,),
-        );
-        // topics : ("EmployeeAdded", company_id, employee)
-        // data   : (commitment,)
+        payroll_events::emit_employee_added(&env, company_id, employee, commitment);
     }
 
     fn remove_employee(env: Env, company_id: u64, employee: Address) {
@@ -261,12 +253,7 @@ impl PayrollRegistryTrait for PayrollRegistry {
             .persistent()
             .remove(&DataKey::Employee(company_id, emp));
 
-        env.events().publish(
-            (Symbol::new(&env, "EmployeeRemoved"), company_id, employee),
-            (),
-        );
-        // topics : ("EmployeeRemoved", company_id, employee)
-        // data   : ()
+        payroll_events::emit_employee_removed(&env, company_id, employee);
     }
 
     fn update_commitment(env: Env, company_id: u64, employee: Address, new_commitment: BytesN<32>) {
@@ -287,12 +274,12 @@ impl PayrollRegistryTrait for PayrollRegistry {
 
         env.storage().persistent().set(&key, &new_commitment);
 
-        env.events().publish(
-            (Symbol::new(&env, "CommitmentUpdated"), company_id, employee),
-            (new_commitment,),
+        payroll_events::emit_registry_commitment_updated(
+            &env,
+            company_id,
+            employee,
+            new_commitment,
         );
-        // topics : ("CommitmentUpdated", company_id, employee)
-        // data   : (new_commitment,)
     }
 
     fn get_company(env: Env, company_id: u64) -> CompanyInfo {
@@ -328,9 +315,27 @@ impl PayrollRegistryTrait for PayrollRegistry {
             panic!("Employee not found");
         }
 
+        let prev_status: EmployeeStatus = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EmpStatus(company_id, employee.clone()))
+            .unwrap_or(EmployeeStatus::Incomplete);
+
         env.storage()
             .persistent()
-            .set(&DataKey::EmpStatus(company_id, employee), &status);
+            .set(&DataKey::EmpStatus(company_id, employee.clone()), &status);
+
+        let prev_sym = match prev_status {
+            EmployeeStatus::Active => Symbol::new(&env, "active"),
+            EmployeeStatus::Inactive => Symbol::new(&env, "inactive"),
+            EmployeeStatus::Incomplete => Symbol::new(&env, "incomplete"),
+        };
+        let new_sym = match status {
+            EmployeeStatus::Active => Symbol::new(&env, "active"),
+            EmployeeStatus::Inactive => Symbol::new(&env, "inactive"),
+            EmployeeStatus::Incomplete => Symbol::new(&env, "incomplete"),
+        };
+        payroll_events::emit_employee_status_changed(&env, company_id, employee, prev_sym, new_sym);
     }
 
     fn get_employee_status(env: Env, company_id: u64, employee: Address) -> EmployeeStatus {
@@ -384,13 +389,14 @@ impl PayrollRegistryTrait for PayrollRegistry {
         }
 
         let proposal = PendingCompanyRotation {
-            new_holder: new_admin,
-            proposed_by: current_admin,
+            new_holder: new_admin.clone(),
+            proposed_by: current_admin.clone(),
             proposed_at: env.ledger().timestamp(),
         };
         env.storage()
             .persistent()
             .set(&DataKey::PendingAdminRotation(company_id), &proposal);
+        payroll_events::emit_company_admin_proposed(&env, company_id, current_admin, new_admin);
     }
 
     fn accept_admin_rotation(env: Env, company_id: u64, new_admin: Address) {
@@ -423,10 +429,11 @@ impl PayrollRegistryTrait for PayrollRegistry {
             .remove(&DataKey::PendingAdminRotation(company_id));
         env.storage()
             .persistent()
-            .remove(&DataKey::CompanyAdmin(old_admin));
+            .remove(&DataKey::CompanyAdmin(old_admin.clone()));
         env.storage()
             .persistent()
-            .set(&DataKey::CompanyAdmin(new_admin), &company_id);
+            .set(&DataKey::CompanyAdmin(new_admin.clone()), &company_id);
+        payroll_events::emit_company_admin_rotated(&env, company_id, old_admin, new_admin);
     }
 
     fn cancel_admin_rotation(env: Env, company_id: u64, current_admin: Address) {
@@ -451,6 +458,7 @@ impl PayrollRegistryTrait for PayrollRegistry {
         env.storage()
             .persistent()
             .remove(&DataKey::PendingAdminRotation(company_id));
+        payroll_events::emit_company_admin_rotation_cancelled(&env, company_id, current_admin);
     }
 
     fn propose_treasury_rotation(
@@ -479,13 +487,19 @@ impl PayrollRegistryTrait for PayrollRegistry {
         }
 
         let proposal = PendingCompanyRotation {
-            new_holder: new_treasury,
-            proposed_by: current_admin,
+            new_holder: new_treasury.clone(),
+            proposed_by: current_admin.clone(),
             proposed_at: env.ledger().timestamp(),
         };
         env.storage()
             .persistent()
             .set(&DataKey::PendingTreasuryRotation(company_id), &proposal);
+        payroll_events::emit_company_treasury_proposed(
+            &env,
+            company_id,
+            current_admin,
+            new_treasury,
+        );
     }
 
     fn accept_treasury_rotation(env: Env, company_id: u64, new_treasury: Address) {
@@ -507,13 +521,15 @@ impl PayrollRegistryTrait for PayrollRegistry {
             .get(&DataKey::Company(company_id))
             .expect("Company not found");
 
-        info.treasury = new_treasury;
+        let old_treasury = info.treasury.clone();
+        info.treasury = new_treasury.clone();
         env.storage()
             .persistent()
             .set(&DataKey::Company(company_id), &info);
         env.storage()
             .persistent()
             .remove(&DataKey::PendingTreasuryRotation(company_id));
+        payroll_events::emit_company_treasury_rotated(&env, company_id, old_treasury, new_treasury);
     }
 }
 

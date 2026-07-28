@@ -3,6 +3,8 @@
 use pause_manager::PauseManagerClient;
 use soroban_sdk::{contract, contractimpl, contracttype, Address, BytesN, Env, Symbol, Vec};
 
+use payroll_events;
+
 // ---------------------------------------------------------------------------
 // Operational roles
 //
@@ -57,7 +59,7 @@ pub struct PendingRotation {
     pub proposed_at: u64,
 }
 
-    /// Storage keys
+/// Storage keys
 #[contracttype]
 pub enum DataKey {
     Commitment(Address),
@@ -106,6 +108,7 @@ impl SalaryCommitmentContract {
         env.storage()
             .persistent()
             .set(&DataKey::PayrollOperator, &operator);
+        payroll_events::emit_payroll_operator_set(&env, operator);
     }
 
     /// Lock an employee's commitment to prevent updates via `update_commitment`
@@ -124,10 +127,7 @@ impl SalaryCommitmentContract {
         }
         env.storage().persistent().set(&key, &true);
 
-        env.events().publish(
-            (Symbol::new(&env, "CommitmentLocked"), employee),
-            (),
-        );
+        payroll_events::emit_commitment_locked(&env, employee);
     }
 
     /// Unlock an employee's commitment so it can be updated again.
@@ -141,10 +141,7 @@ impl SalaryCommitmentContract {
         }
         env.storage().persistent().remove(&key);
 
-        env.events().publish(
-            (Symbol::new(&env, "CommitmentUnlocked"), employee),
-            (),
-        );
+        payroll_events::emit_commitment_unlocked(&env, employee);
     }
 
     /// Check if an employee's commitment is currently locked.
@@ -190,12 +187,7 @@ impl SalaryCommitmentContract {
         env.storage().persistent().set(&key, &salary_commitment);
 
         // Emit CommitmentUpdated event so off-chain indexers track commitment history.
-        env.events().publish(
-            (Symbol::new(&env, "CommitmentUpdated"), employee),
-            (commitment,),
-        );
-        // topics : ("CommitmentUpdated", employee)
-        // data   : (commitment,)
+        payroll_events::emit_commitment_stored(&env, employee, commitment);
 
         salary_commitment
     }
@@ -241,12 +233,7 @@ impl SalaryCommitmentContract {
 
         env.storage().persistent().set(&key, &updated);
 
-        env.events().publish(
-            (Symbol::new(&env, "CommitmentUpdated"), employee),
-            (new_commitment,),
-        );
-        // topics : ("CommitmentUpdated", employee)
-        // data   : (new_commitment,)
+        payroll_events::emit_commitment_stored(&env, employee, new_commitment);
 
         updated
     }
@@ -288,9 +275,11 @@ impl SalaryCommitmentContract {
         let rotated = Self::store_commitment(env.clone(), employee.clone(), new_commitment);
 
         // Emit an explicit rotation event
-        env.events().publish(
-            (Symbol::new(&env, "CommitmentRotated"), employee),
-            (existing.commitment, rotated.commitment.clone()),
+        payroll_events::emit_commitment_rotated(
+            &env,
+            employee,
+            existing.commitment,
+            rotated.commitment.clone(),
         );
 
         rotated
@@ -392,10 +381,7 @@ impl SalaryCommitmentContract {
         env.storage().persistent().set(&employee_key, &reference_id);
         env.storage().persistent().set(&index_key, &employee);
 
-        env.events().publish(
-            (Symbol::new(&env, "ReferenceIdSet"), employee.clone()),
-            (reference_id,),
-        );
+        payroll_events::emit_reference_id_set(&env, employee, reference_id);
     }
 
     /// Get the external reference ID for an employee (if set).
@@ -432,6 +418,7 @@ impl SalaryCommitmentContract {
         };
 
         env.storage().persistent().set(&key, &payment_nullifier);
+        payroll_events::emit_nullifier_recorded(&env, payment_nullifier.nullifier);
     }
 
     /// Check if a nullifier has been used
@@ -510,7 +497,11 @@ impl SalaryCommitmentContract {
         }
         current_admin.require_auth();
 
-        if env.storage().persistent().has(&DataKey::PendingAdminRotation) {
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::PendingAdminRotation)
+        {
             panic!("A pending admin rotation already exists");
         }
 
@@ -523,10 +514,7 @@ impl SalaryCommitmentContract {
             .persistent()
             .set(&DataKey::PendingAdminRotation, &proposal);
 
-        env.events().publish(
-            (Symbol::new(&env, "AdminRotationProposed"), current_admin),
-            (new_admin,),
-        );
+        payroll_events::emit_commitment_admin_proposed(&env, current_admin, new_admin);
     }
 
     /// Accept a pending admin rotation (step 2 of 2).
@@ -543,17 +531,12 @@ impl SalaryCommitmentContract {
         }
         new_admin.require_auth();
 
-        env.storage()
-            .persistent()
-            .set(&DataKey::Admin, &new_admin);
+        env.storage().persistent().set(&DataKey::Admin, &new_admin);
         env.storage()
             .persistent()
             .remove(&DataKey::PendingAdminRotation);
 
-        env.events().publish(
-            (Symbol::new(&env, "AdminRotationAccepted"), new_admin),
-            (),
-        );
+        payroll_events::emit_commitment_admin_accepted(&env, new_admin);
     }
 
     /// Cancel a pending admin rotation proposal.
@@ -569,22 +552,25 @@ impl SalaryCommitmentContract {
         }
         current_admin.require_auth();
 
-        if !env.storage().persistent().has(&DataKey::PendingAdminRotation) {
+        if !env
+            .storage()
+            .persistent()
+            .has(&DataKey::PendingAdminRotation)
+        {
             panic!("No pending admin rotation to cancel");
         }
         env.storage()
             .persistent()
             .remove(&DataKey::PendingAdminRotation);
 
-        env.events().publish(
-            (Symbol::new(&env, "AdminRotationCancelled"), current_admin),
-            (),
-        );
+        payroll_events::emit_commitment_admin_cancelled(&env, current_admin);
     }
 
     /// Get the pending admin rotation proposal, if any.
     pub fn get_pending_admin_rotation(env: Env) -> Option<PendingRotation> {
-        env.storage().persistent().get(&DataKey::PendingAdminRotation)
+        env.storage()
+            .persistent()
+            .get(&DataKey::PendingAdminRotation)
     }
 
     // ── Issue #193: pause support ────────────────────────────────────────────
@@ -595,6 +581,7 @@ impl SalaryCommitmentContract {
         env.storage()
             .persistent()
             .set(&DataKey::PauseManager, &pause_manager);
+        payroll_events::emit_commitment_pause_manager_set(&env, pause_manager);
     }
 
     fn require_not_paused(env: &Env) {
