@@ -461,4 +461,67 @@ mod e2e {
         let expected_nullifier = BytesN::from_array(env, &[0u8; 32]);
         assert!(ctx.commitment_client.is_nullifier_used(&expected_nullifier));
     }
+
+    /// End-to-end metadata hash verification (issue #177).
+    ///
+    /// Full flow: commit metadata hash → execute batch → bind metadata to run
+    /// → verify on-chain hash matches the committed value → verify mismatch
+    /// detection.
+    #[test]
+    fn test_e2e_metadata_hash_verification() {
+        let ctx = setup();
+        let env = &ctx.env;
+
+        // ── PHASE 1: Setup employee and treasury ─────────────────────────────
+        let commitment = alice_salary_commitment(&ctx.commitment_client);
+        ctx.commitment_client
+            .store_commitment(&ctx.alice, &commitment);
+        ctx.registry_client
+            .add_employee(&ctx.company_id, &ctx.alice, &commitment);
+
+        let initial_treasury: i128 = 10_000;
+        ctx.token_client.mint(&ctx.treasury, &initial_treasury);
+
+        // ── PHASE 2: Execute payroll ─────────────────────────────────────────
+        let payment_amount: i128 = 5_000;
+        let proof = mock_proof(env);
+
+        let mut proofs = Vec::new(env);
+        proofs.push_back(proof);
+        let mut amounts = Vec::new(env);
+        amounts.push_back(payment_amount);
+        let mut employees = Vec::new(env);
+        employees.push_back(ctx.alice.clone());
+
+        let run_id = ctx.payroll_client.batch_process_payroll(
+            &proofs,
+            &amounts,
+            &employees,
+            &payment_amount,
+            &test_nonce(env, 7),
+            &None,
+        );
+        assert!(run_id > 0);
+
+        // ── PHASE 3: Metadata hash defaults to zero ──────────────────────────
+        let zero_hash = BytesN::from_array(env, &[0u8; 32]);
+        let stored_hash = ctx.payroll_client.get_metadata_hash(&run_id);
+        assert_eq!(stored_hash, zero_hash);
+        assert!(ctx.payroll_client.verify_metadata_hash(&run_id, &zero_hash));
+
+        // ── PHASE 4: Commit and bind metadata hash ───────────────────────────
+        let meta_hash = BytesN::from_array(env, &[0xAB; 32]);
+        ctx.payroll_client.commit_metadata_hash(&ctx.admin, &meta_hash);
+        ctx.payroll_client
+            .set_run_metadata(&ctx.admin, &run_id, &meta_hash);
+
+        // ── PHASE 5: Verify on-chain hash matches committed value ────────────
+        let retrieved = ctx.payroll_client.get_metadata_hash(&run_id);
+        assert_eq!(retrieved, meta_hash);
+        assert!(ctx.payroll_client.verify_metadata_hash(&run_id, &meta_hash));
+
+        // ── PHASE 6: Verify mismatch detection ───────────────────────────────
+        let wrong_hash = BytesN::from_array(env, &[0xCD; 32]);
+        assert!(!ctx.payroll_client.verify_metadata_hash(&run_id, &wrong_hash));
+    }
 }

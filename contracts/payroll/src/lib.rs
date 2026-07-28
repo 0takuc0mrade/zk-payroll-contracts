@@ -1283,6 +1283,42 @@ impl Payroll {
             .persistent()
             .get(&DataKey::PendingTreasuryRotation)
     }
+
+    // ── Issue #177: metadata hash verification ──────────────────────────────
+
+    /// Return the metadata hash bound to a completed payroll run.
+    ///
+    /// Returns the raw `BytesN<32>` stored in the run record. The zero hash
+    /// indicates no metadata has been bound yet.
+    pub fn get_metadata_hash(e: Env, run_id: u64) -> BytesN<32> {
+        let run: PayrollRun = e
+            .storage()
+            .persistent()
+            .get(&DataKey::PayrollRun(run_id))
+            .expect("Run not found");
+        run.metadata_hash
+    }
+
+    /// Verify that the metadata hash stored on-chain for a payroll run matches
+    /// the expected value.
+    ///
+    /// This is a read-only verification function: it retrieves the
+    /// `metadata_hash` from the completed `PayrollRun` record and compares it
+    /// byte-for-byte against `expected_hash`. Returns `true` if they match,
+    /// `false` otherwise.
+    ///
+    /// Use cases:
+    ///   - Off-chain auditors can call this to confirm the on-chain state
+    ///     aligns with their locally computed metadata hash.
+    ///   - Other contracts can call this for cross-contract verification.
+    pub fn verify_metadata_hash(e: Env, run_id: u64, expected_hash: BytesN<32>) -> bool {
+        let run: PayrollRun = e
+            .storage()
+            .persistent()
+            .get(&DataKey::PayrollRun(run_id))
+            .expect("Run not found");
+        run.metadata_hash == expected_hash
+    }
 }
 
 #[cfg(test)]
@@ -2949,5 +2985,156 @@ mod tests {
 
         let result = payroll_client.try_finalize_run_draft(&admin, &draft_id);
         assert!(result.is_err());
+    }
+
+    // ── Issue #177: metadata hash verification tests ─────────────────────────
+
+    #[test]
+    fn test_verify_metadata_hash_returns_true_on_match() {
+        let env = Env::default();
+        let (payroll_client, admin, _treasury, _treasury_owner, employee) =
+            setup_simple_payroll(&env);
+
+        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
+        let run_id = payroll_client.batch_process_payroll(
+            &proofs, &amounts, &employees, &1000, &test_nonce(&env, 60), &None,
+        );
+
+        let meta_hash = BytesN::from_array(&env, &[0xaau8; 32]);
+        payroll_client.commit_metadata_hash(&admin, &meta_hash);
+        payroll_client.set_run_metadata(&admin, &run_id, &meta_hash);
+
+        assert!(payroll_client.verify_metadata_hash(&run_id, &meta_hash));
+    }
+
+    #[test]
+    fn test_verify_metadata_hash_returns_false_on_mismatch() {
+        let env = Env::default();
+        let (payroll_client, admin, _treasury, _treasury_owner, employee) =
+            setup_simple_payroll(&env);
+
+        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
+        let run_id = payroll_client.batch_process_payroll(
+            &proofs, &amounts, &employees, &1000, &test_nonce(&env, 61), &None,
+        );
+
+        let meta_hash = BytesN::from_array(&env, &[0xbbu8; 32]);
+        payroll_client.commit_metadata_hash(&admin, &meta_hash);
+        payroll_client.set_run_metadata(&admin, &run_id, &meta_hash);
+
+        let wrong_hash = BytesN::from_array(&env, &[0xccu8; 32]);
+        assert!(!payroll_client.verify_metadata_hash(&run_id, &wrong_hash));
+    }
+
+    #[test]
+    #[should_panic(expected = "Run not found")]
+    fn test_verify_metadata_hash_nonexistent_run_panics() {
+        let env = Env::default();
+        let (payroll_client, _admin, _treasury, _treasury_owner, _employee) =
+            setup_simple_payroll(&env);
+
+        let hash = BytesN::from_array(&env, &[0xddu8; 32]);
+        payroll_client.verify_metadata_hash(&999u64, &hash);
+    }
+
+    #[test]
+    fn test_verify_metadata_hash_unbound_defaults_to_zero() {
+        let env = Env::default();
+        let (payroll_client, _admin, _treasury, _treasury_owner, employee) =
+            setup_simple_payroll(&env);
+
+        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
+        let run_id = payroll_client.batch_process_payroll(
+            &proofs, &amounts, &employees, &1000, &test_nonce(&env, 62), &None,
+        );
+
+        let zero = BytesN::from_array(&env, &[0u8; 32]);
+        assert!(payroll_client.verify_metadata_hash(&run_id, &zero));
+    }
+
+    #[test]
+    fn test_get_metadata_hash_returns_bound_value() {
+        let env = Env::default();
+        let (payroll_client, admin, _treasury, _treasury_owner, employee) =
+            setup_simple_payroll(&env);
+
+        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
+        let run_id = payroll_client.batch_process_payroll(
+            &proofs, &amounts, &employees, &1000, &test_nonce(&env, 63), &None,
+        );
+
+        let meta_hash = BytesN::from_array(&env, &[0xeeu8; 32]);
+        payroll_client.commit_metadata_hash(&admin, &meta_hash);
+        payroll_client.set_run_metadata(&admin, &run_id, &meta_hash);
+
+        let stored = payroll_client.get_metadata_hash(&run_id);
+        assert_eq!(stored, meta_hash);
+    }
+
+    #[test]
+    fn test_commit_metadata_hash_event_emitted() {
+        let env = Env::default();
+        let (payroll_client, admin, _treasury, _treasury_owner, _employee) =
+            setup_simple_payroll(&env);
+
+        let meta_hash = BytesN::from_array(&env, &[0xffu8; 32]);
+        let before = env.events().all().len();
+        payroll_client.commit_metadata_hash(&admin, &meta_hash);
+        let after = env.events().all().len();
+        assert!(after > before);
+    }
+
+    #[test]
+    fn test_metadata_hash_verification_after_commit_bind_cycle() {
+        let env = Env::default();
+        let (payroll_client, admin, _treasury, _treasury_owner, employee) =
+            setup_simple_payroll(&env);
+
+        let hash_a = BytesN::from_array(&env, &[0x11u8; 32]);
+        let hash_b = BytesN::from_array(&env, &[0x22u8; 32]);
+
+        payroll_client.commit_metadata_hash(&admin, &hash_a);
+        payroll_client.commit_metadata_hash(&admin, &hash_b);
+
+        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
+        let run_id = payroll_client.batch_process_payroll(
+            &proofs, &amounts, &employees, &1000, &test_nonce(&env, 64), &None,
+        );
+
+        payroll_client.set_run_metadata(&admin, &run_id, &hash_a);
+
+        assert!(payroll_client.verify_metadata_hash(&run_id, &hash_a));
+        assert!(!payroll_client.verify_metadata_hash(&run_id, &hash_b));
+    }
+
+    #[test]
+    #[should_panic(expected = "Unauthorized")]
+    fn test_commit_metadata_hash_rejects_non_admin() {
+        let env = Env::default();
+        let (payroll_client, _admin, _treasury, _treasury_owner, _employee) =
+            setup_simple_payroll(&env);
+
+        let attacker = Address::generate(&env);
+        let meta_hash = BytesN::from_array(&env, &[0x33u8; 32]);
+        payroll_client.commit_metadata_hash(&attacker, &meta_hash);
+    }
+
+    #[test]
+    #[should_panic(expected = "Unauthorized")]
+    fn test_set_run_metadata_rejects_non_admin() {
+        let env = Env::default();
+        let (payroll_client, admin, _treasury, _treasury_owner, employee) =
+            setup_simple_payroll(&env);
+
+        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
+        let run_id = payroll_client.batch_process_payroll(
+            &proofs, &amounts, &employees, &1000, &test_nonce(&env, 65), &None,
+        );
+
+        let meta_hash = BytesN::from_array(&env, &[0x44u8; 32]);
+        payroll_client.commit_metadata_hash(&admin, &meta_hash);
+
+        let attacker = Address::generate(&env);
+        payroll_client.set_run_metadata(&attacker, &run_id, &meta_hash);
     }
 }
