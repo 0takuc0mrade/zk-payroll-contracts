@@ -145,6 +145,26 @@ pub struct PendingRotation {
     pub proposed_at: u64,
 }
 
+// ── Issue #147: company lifecycle state ──────────────────────────────────────
+
+/// Lifecycle state of the company operating this payroll contract.
+///
+/// Payroll execution is only permitted when the state is `Active`. This gate
+/// runs before any auth checks, balance reads, or transfer logic so that
+/// rejected calls are fully clean with no partial side effects.
+#[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompanyState {
+    /// Normal operating state — payroll execution permitted.
+    Active,
+    /// Operations suspended; payroll execution rejected until set to Active.
+    Paused,
+    /// Company decommissioned; no further payroll runs are permitted.
+    Archived,
+    /// Onboarding incomplete; payroll execution not yet permitted.
+    Incomplete,
+}
+
 // ── Storage keys ──────────────────────────────────────────────────────────────
 // Issue #196: Storage Key Versioning Strategy
 //
@@ -256,6 +276,12 @@ pub enum DataKey {
     DraftCommitment(BytesN<32>),
     /// Pending emergency withdrawal request (#104).
     EmergencyRequest,
+    /// Accumulated deposit balance per depositor address (#62).
+    CompanyBalance(Address),
+    /// Marks a completed payroll run as archived for long-term reporting (#146).
+    ArchivedRun(u64),
+    /// Company lifecycle state gate for payroll execution (#147).
+    CompanyState,
     // Future upgrade example (issue #196):
     // PayrollRunV2(u64),  // Would be added here when schema evolution is needed
 }
@@ -304,6 +330,30 @@ impl Payroll {
         }
     }
 
+    // Issue #147: reject payroll execution for any non-Active company state.
+    // Absent state defaults to Active for backward compatibility with existing
+    // deployments that predate this field.
+    fn require_company_active(e: &Env) {
+        if let Some(state) = e
+            .storage()
+            .persistent()
+            .get::<_, CompanyState>(&DataKey::CompanyState)
+        {
+            match state {
+                CompanyState::Active => {}
+                CompanyState::Paused => {
+                    panic!("Company is paused; payroll execution is not permitted")
+                }
+                CompanyState::Archived => {
+                    panic!("Company is archived; payroll execution is not permitted")
+                }
+                CompanyState::Incomplete => {
+                    panic!("Company setup is incomplete; payroll execution is not permitted")
+                }
+            }
+        }
+    }
+
     pub fn set_pause_manager(e: Env, pause_manager: Address) {
         let addrs: ContractAddresses = e
             .storage()
@@ -346,10 +396,32 @@ impl Payroll {
         let token_client = soroban_token::Client::new(&e, &addrs.token);
         token_client.transfer(&from, &addrs.treasury, &amount);
 
+        // Issue #62: accumulate per-depositor balance for auditability.
+        let balance_key = DataKey::CompanyBalance(from.clone());
+        let prev_balance: i128 = e
+            .storage()
+            .persistent()
+            .get(&balance_key)
+            .unwrap_or(0i128);
+        let new_balance = prev_balance + amount;
+        e.storage().persistent().set(&balance_key, &new_balance);
+
         e.events().publish(
             (symbol_short!("payroll"), Symbol::new(&e, "deposit")),
-            (from, amount, deposit_id),
+            (from, amount, deposit_id, new_balance),
         );
+    }
+
+    /// Return the accumulated deposit balance for a given depositor address (#62).
+    ///
+    /// This reflects the running total of all successful deposits made by that
+    /// address. It is an accounting record only; actual treasury liquidity is
+    /// held by the token contract at `ContractAddresses.treasury`.
+    pub fn get_treasury_balance(e: Env, depositor: Address) -> i128 {
+        e.storage()
+            .persistent()
+            .get(&DataKey::CompanyBalance(depositor))
+            .unwrap_or(0i128)
     }
 
     fn derive_run_id(e: &Env) -> u64 {
@@ -804,6 +876,10 @@ impl Payroll {
             .get(&DataKey::Addresses)
             .expect("Not initialized");
 
+        // Issue #147: gate on company lifecycle state before any auth, balance,
+        // or transfer logic runs, so rejected calls produce no partial side effects.
+        Self::require_company_active(&e);
+
         if e.storage().persistent().has(&DataKey::PauseManager) {
             let pm_addr: Address = e
                 .storage()
@@ -823,9 +899,20 @@ impl Payroll {
         // #103 — mark nonce as consumed (store run_id for auditability).
         e.storage().persistent().set(&nonce_key, &run_id);
 
+        let token_client = soroban_token::Client::new(&e, &addrs.token);
+
+        // Issue #62: fail early if the treasury token balance cannot cover the
+        // full batch payout, before any proof verification or transfers begin.
+        let treasury_balance = token_client.balance(&addrs.treasury);
+        if treasury_balance < expected_total_spend {
+            panic!(
+                "Insufficient treasury balance: available {} but batch requires {}",
+                treasury_balance, expected_total_spend
+            );
+        }
+
         let verifier = ProofVerifierClient::new(&e, &addrs.verifier);
         let commitment_client = SalaryCommitmentContractClient::new(&e, &addrs.commitment);
-        let token_client = soroban_token::Client::new(&e, &addrs.token);
 
         for i in 0..count {
             let proof = proofs.get(i).unwrap();
@@ -1337,6 +1424,106 @@ impl Payroll {
             .get(&DataKey::PayrollRun(run_id))
             .expect("Run not found");
         run.metadata_hash == expected_hash
+    }
+
+    // ── Issue #147: company state management ─────────────────────────────────
+
+    /// Set the company lifecycle state.
+    ///
+    /// Only the admin may call. After setting to anything other than `Active`,
+    /// all subsequent `batch_process_payroll` calls will be rejected with a
+    /// descriptive error until the state is restored to `Active`.
+    pub fn set_company_state(e: Env, admin: Address, state: CompanyState) {
+        let addrs: ContractAddresses = e
+            .storage()
+            .persistent()
+            .get(&DataKey::Addresses)
+            .expect("Not initialized");
+        if admin != addrs.admin {
+            panic!("Unauthorized");
+        }
+        admin.require_auth();
+        e.storage()
+            .persistent()
+            .set(&DataKey::CompanyState, &state);
+        e.events().publish(
+            (symbol_short!("payroll"), Symbol::new(&e, "state_changed")),
+            state,
+        );
+    }
+
+    /// Return the current company state. Returns `Active` if no state has been
+    /// explicitly set (backward-compatible default).
+    pub fn get_company_state(e: Env) -> CompanyState {
+        e.storage()
+            .persistent()
+            .get(&DataKey::CompanyState)
+            .unwrap_or(CompanyState::Active)
+    }
+
+    // ── Issue #146: archived payroll run queries ──────────────────────────────
+
+    /// Mark a completed payroll run as archived for long-term reporting.
+    ///
+    /// Only the admin may archive. Archiving is additive and read-only: it
+    /// flags the run without altering the underlying `PayrollRun` record,
+    /// cannot trigger execution, state transitions, or treasury mutations.
+    pub fn archive_payroll_run(e: Env, admin: Address, run_id: u64) {
+        let addrs: ContractAddresses = e
+            .storage()
+            .persistent()
+            .get(&DataKey::Addresses)
+            .expect("Not initialized");
+        if admin != addrs.admin {
+            panic!("Unauthorized");
+        }
+        admin.require_auth();
+
+        // Ensure the run exists before archiving it.
+        if !e
+            .storage()
+            .persistent()
+            .has(&DataKey::PayrollRun(run_id))
+        {
+            panic!("Run not found");
+        }
+
+        let archive_key = DataKey::ArchivedRun(run_id);
+        if e.storage().persistent().has(&archive_key) {
+            panic!("Run is already archived");
+        }
+        e.storage().persistent().set(&archive_key, &true);
+
+        e.events().publish(
+            (symbol_short!("payroll"), Symbol::new(&e, "run_archived")),
+            run_id,
+        );
+    }
+
+    /// Return a payroll run only if it has been explicitly archived.
+    ///
+    /// This is the dedicated archived-query path: it is fully read-only and
+    /// panics for runs that exist but have not been archived, keeping the
+    /// archived and active access paths clearly separated.
+    pub fn get_archived_run(e: Env, run_id: u64) -> PayrollRun {
+        if !e
+            .storage()
+            .persistent()
+            .has(&DataKey::ArchivedRun(run_id))
+        {
+            panic!("Run is not archived");
+        }
+        e.storage()
+            .persistent()
+            .get(&DataKey::PayrollRun(run_id))
+            .expect("Run not found")
+    }
+
+    /// Return `true` if the run has been marked as archived, `false` otherwise.
+    pub fn is_run_archived(e: Env, run_id: u64) -> bool {
+        e.storage()
+            .persistent()
+            .has(&DataKey::ArchivedRun(run_id))
     }
 }
 
@@ -3155,5 +3342,260 @@ mod tests {
 
         let attacker = Address::generate(&env);
         payroll_client.set_run_metadata(&attacker, &run_id, &meta_hash);
+    }
+
+    // ── Issue #62: treasury deposit and balance accounting ────────────────────
+
+    #[test]
+    fn test_deposit_increments_company_balance() {
+        let env = Env::default();
+        let (payroll_client, _admin, treasury, _treasury_owner, _employee) =
+            setup_simple_payroll(&env);
+
+        assert_eq!(payroll_client.get_treasury_balance(&treasury), 0i128);
+
+        let id1 = BytesN::from_array(&env, &[0xb1u8; 32]);
+        payroll_client.deposit(&treasury, &300i128, &id1);
+        assert_eq!(payroll_client.get_treasury_balance(&treasury), 300i128);
+
+        let id2 = BytesN::from_array(&env, &[0xb2u8; 32]);
+        payroll_client.deposit(&treasury, &700i128, &id2);
+        assert_eq!(payroll_client.get_treasury_balance(&treasury), 1_000i128);
+    }
+
+    #[test]
+    fn test_get_treasury_balance_returns_zero_for_new_address() {
+        let env = Env::default();
+        let (payroll_client, _admin, _treasury, _treasury_owner, _employee) =
+            setup_simple_payroll(&env);
+
+        let unknown = Address::generate(&env);
+        assert_eq!(payroll_client.get_treasury_balance(&unknown), 0i128);
+    }
+
+    #[test]
+    fn test_batch_process_fails_with_insufficient_treasury() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let verifier_id = env.register_contract(None, ProofVerifier);
+        let verifier_client = ProofVerifierClient::new(&env, &verifier_id);
+        let verifier_admin = Address::generate(&env);
+        verifier_client.init_verifier_admin(&verifier_admin);
+        verifier_client.initialize_verifier(&mock_vk(&env));
+
+        let commitment_id = env.register_contract(None, SalaryCommitmentContract);
+        let commitment_client = SalaryCommitmentContractClient::new(&env, &commitment_id);
+        let commitment_admin = Address::generate(&env);
+        commitment_client.init_commitment_admin(&commitment_admin);
+
+        let token_id = env.register_contract(None, Token);
+        let token_client = TokenClient::new(&env, &token_id);
+
+        let payroll_id = env.register_contract(None, Payroll);
+        let payroll_client = PayrollClient::new(&env, &payroll_id);
+
+        let treasury = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let treasury_owner = Address::generate(&env);
+
+        // Mint only 50 tokens — not enough for a 1000 payment.
+        token_client.mint(&treasury, &50i128);
+        payroll_client.initialize(
+            &admin, &token_id, &verifier_id, &commitment_id, &treasury, &treasury_owner,
+        );
+        commitment_client.set_payroll_operator(&payroll_id);
+
+        let employee = Address::generate(&env);
+        commitment_client.store_commitment(&employee, &BytesN::from_array(&env, &[0u8; 32]));
+
+        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1_000);
+        let result = payroll_client.try_batch_process_payroll(
+            &proofs, &amounts, &employees, &1_000, &test_nonce(&env, 214), &None,
+        );
+        assert!(result.is_err(), "Batch must fail when treasury is underfunded");
+    }
+
+    // ── Issue #146: archived payroll run queries ──────────────────────────────
+
+    #[test]
+    fn test_archive_payroll_run_marks_run_archived() {
+        let env = Env::default();
+        let (payroll_client, admin, _treasury, _treasury_owner, employee) =
+            setup_simple_payroll(&env);
+
+        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
+        let run_id = payroll_client.batch_process_payroll(
+            &proofs, &amounts, &employees, &1000, &test_nonce(&env, 220), &None,
+        );
+
+        assert!(!payroll_client.is_run_archived(&run_id));
+        payroll_client.archive_payroll_run(&admin, &run_id);
+        assert!(payroll_client.is_run_archived(&run_id));
+    }
+
+    #[test]
+    fn test_get_archived_run_returns_correct_run() {
+        let env = Env::default();
+        let (payroll_client, admin, _treasury, _treasury_owner, employee) =
+            setup_simple_payroll(&env);
+
+        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
+        let run_id = payroll_client.batch_process_payroll(
+            &proofs, &amounts, &employees, &1000, &test_nonce(&env, 221), &None,
+        );
+        payroll_client.archive_payroll_run(&admin, &run_id);
+
+        let archived = payroll_client.get_archived_run(&run_id);
+        assert_eq!(archived.run_id, run_id);
+        assert_eq!(archived.total_amount, 1000i128);
+    }
+
+    #[test]
+    fn test_get_archived_run_panics_for_non_archived_run() {
+        let env = Env::default();
+        let (payroll_client, _admin, _treasury, _treasury_owner, employee) =
+            setup_simple_payroll(&env);
+
+        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
+        let run_id = payroll_client.batch_process_payroll(
+            &proofs, &amounts, &employees, &1000, &test_nonce(&env, 222), &None,
+        );
+
+        let result = payroll_client.try_get_archived_run(&run_id);
+        assert!(result.is_err(), "Non-archived run must not be accessible via get_archived_run");
+    }
+
+    #[test]
+    fn test_get_payroll_run_still_works_for_archived_run() {
+        let env = Env::default();
+        let (payroll_client, admin, _treasury, _treasury_owner, employee) =
+            setup_simple_payroll(&env);
+
+        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
+        let run_id = payroll_client.batch_process_payroll(
+            &proofs, &amounts, &employees, &1000, &test_nonce(&env, 223), &None,
+        );
+        payroll_client.archive_payroll_run(&admin, &run_id);
+
+        // Original get_payroll_run must still return the same record.
+        let run = payroll_client.get_payroll_run(&run_id);
+        assert_eq!(run.run_id, run_id);
+    }
+
+    // ── Issue #147: company state gate ───────────────────────────────────────
+
+    #[test]
+    fn test_batch_process_succeeds_with_no_company_state_set() {
+        // Default (no state stored) should behave as Active.
+        let env = Env::default();
+        let (payroll_client, _admin, _treasury, _treasury_owner, employee) =
+            setup_simple_payroll(&env);
+
+        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
+        let run_id = payroll_client.batch_process_payroll(
+            &proofs, &amounts, &employees, &1000, &test_nonce(&env, 230), &None,
+        );
+        assert!(run_id > 0);
+    }
+
+    #[test]
+    fn test_batch_process_succeeds_when_company_active() {
+        let env = Env::default();
+        let (payroll_client, admin, _treasury, _treasury_owner, employee) =
+            setup_simple_payroll(&env);
+
+        payroll_client.set_company_state(&admin, &CompanyState::Active);
+
+        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
+        let run_id = payroll_client.batch_process_payroll(
+            &proofs, &amounts, &employees, &1000, &test_nonce(&env, 231), &None,
+        );
+        assert!(run_id > 0);
+    }
+
+    #[test]
+    fn test_batch_process_fails_when_company_paused() {
+        let env = Env::default();
+        let (payroll_client, admin, _treasury, _treasury_owner, employee) =
+            setup_simple_payroll(&env);
+
+        payroll_client.set_company_state(&admin, &CompanyState::Paused);
+
+        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
+        let result = payroll_client.try_batch_process_payroll(
+            &proofs, &amounts, &employees, &1000, &test_nonce(&env, 232), &None,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_batch_process_fails_when_company_archived() {
+        let env = Env::default();
+        let (payroll_client, admin, _treasury, _treasury_owner, employee) =
+            setup_simple_payroll(&env);
+
+        payroll_client.set_company_state(&admin, &CompanyState::Archived);
+
+        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
+        let result = payroll_client.try_batch_process_payroll(
+            &proofs, &amounts, &employees, &1000, &test_nonce(&env, 233), &None,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_batch_process_fails_when_company_incomplete() {
+        let env = Env::default();
+        let (payroll_client, admin, _treasury, _treasury_owner, employee) =
+            setup_simple_payroll(&env);
+
+        payroll_client.set_company_state(&admin, &CompanyState::Incomplete);
+
+        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
+        let result = payroll_client.try_batch_process_payroll(
+            &proofs, &amounts, &employees, &1000, &test_nonce(&env, 234), &None,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_set_company_state_rejects_non_admin() {
+        let env = Env::default();
+        let (payroll_client, _admin, _treasury, _treasury_owner, _employee) =
+            setup_simple_payroll(&env);
+
+        let attacker = Address::generate(&env);
+        let result = payroll_client.try_set_company_state(&attacker, &CompanyState::Paused);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_get_company_state_defaults_to_active() {
+        let env = Env::default();
+        let (payroll_client, _admin, _treasury, _treasury_owner, _employee) =
+            setup_simple_payroll(&env);
+
+        assert_eq!(payroll_client.get_company_state(), CompanyState::Active);
+    }
+
+    #[test]
+    fn test_company_can_resume_from_paused_to_active() {
+        let env = Env::default();
+        let (payroll_client, admin, _treasury, _treasury_owner, employee) =
+            setup_simple_payroll(&env);
+
+        payroll_client.set_company_state(&admin, &CompanyState::Paused);
+        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
+        let result = payroll_client.try_batch_process_payroll(
+            &proofs, &amounts, &employees, &1000, &test_nonce(&env, 235), &None,
+        );
+        assert!(result.is_err(), "Paused company must reject payroll");
+
+        payroll_client.set_company_state(&admin, &CompanyState::Active);
+        let run_id = payroll_client.batch_process_payroll(
+            &proofs, &amounts, &employees, &1000, &test_nonce(&env, 236), &None,
+        );
+        assert!(run_id > 0, "Active company must accept payroll after resuming");
     }
 }
