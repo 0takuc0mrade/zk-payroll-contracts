@@ -1022,3 +1022,364 @@ fn test_verify_payroll_metadata_revoked_auditor_rejected() {
     );
     assert_eq!(result.unwrap_err().unwrap(), AuditError::KeyNotFound);
 }
+
+// ── Issue #219: Audit access expiration policy ───────────────────────────────
+//
+// These tests encode the contract's policy for audit access expiry:
+//   1. Every authorize_auditor-gated entry point returns KeyExpired when the
+//      current ledger sequence exceeds expiration_ledger.
+//   2. The contract emits an AuditAccessExpired event at the boundary so
+//      off-chain monitors can trigger re-issuance workflows.
+//   3. get_expiration returns the stored expiry ledger, or KeyNotFound.
+//   4. refresh_view_key extends an existing key; guards against truncation
+//      and wrong-admin calls; rotates key material; emits ViewKeyRefreshed.
+
+// ---------------------------------------------------------------------------
+// Expiry enforcement across all gated entry points
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_expired_key_rejects_verify_commitment_with_key() {
+    let (env, contract_id) = setup();
+    let client = AuditModuleClient::new(&env, &contract_id);
+
+    let auditor = soroban_sdk::Address::generate(&env);
+    let seq = env.ledger().sequence();
+    let expiration = seq + 5;
+    client.generate_view_key(&auditor, &expiration);
+
+    let amount: i128 = 1_000;
+    let blinding = BytesN::from_array(&env, &[0x01; 32]);
+    let stored = make_commitment(&env, amount, &blinding);
+
+    env.ledger().set_sequence_number(expiration + 1);
+
+    let result = client.try_verify_commitment_with_key(
+        &auditor,
+        &stored,
+        &amount,
+        &blinding,
+        &AuditScope::EmployeeList,
+    );
+    assert_eq!(result.unwrap_err().unwrap(), AuditError::KeyExpired);
+}
+
+#[test]
+fn test_expired_key_rejects_verify_commitment_with_view_key() {
+    let (env, contract_id) = setup();
+    let client = AuditModuleClient::new(&env, &contract_id);
+
+    let auditor = soroban_sdk::Address::generate(&env);
+    let seq = env.ledger().sequence();
+    let expiration = seq + 5;
+    let key = client.generate_view_key(&auditor, &expiration);
+
+    let amount: i128 = 2_000;
+    let blinding = BytesN::from_array(&env, &[0x02; 32]);
+    let stored = make_commitment(&env, amount, &blinding);
+
+    env.ledger().set_sequence_number(expiration + 1);
+
+    let result = client.try_verify_commitment_with_view_key(
+        &auditor,
+        &key,
+        &stored,
+        &amount,
+        &blinding,
+        &AuditScope::EmployeeList,
+    );
+    assert_eq!(result.unwrap_err().unwrap(), AuditError::KeyExpired);
+}
+
+#[test]
+fn test_expired_key_rejects_generate_aggregate_report() {
+    let (env, contract_id) = setup();
+    let client = AuditModuleClient::new(&env, &contract_id);
+
+    let auditor = soroban_sdk::Address::generate(&env);
+    let seq = env.ledger().sequence();
+    let expiration = seq + 5;
+    client.generate_view_key(&auditor, &expiration);
+
+    let company_id = Symbol::new(&env, "ACME");
+    let now = env.ledger().timestamp();
+
+    env.ledger().set_sequence_number(expiration + 1);
+
+    let result =
+        client.try_generate_aggregate_report(&auditor, &company_id, &now, &(now + 86_400));
+    assert_eq!(result.unwrap_err().unwrap(), AuditError::KeyExpired);
+}
+
+#[test]
+fn test_expired_key_rejects_export_audit_summary() {
+    let (env, contract_id) = setup();
+    let client = AuditModuleClient::new(&env, &contract_id);
+
+    let auditor = soroban_sdk::Address::generate(&env);
+    let seq = env.ledger().sequence();
+    let expiration = seq + 5;
+    client.generate_view_key(&auditor, &expiration);
+
+    let company_id = Symbol::new(&env, "default");
+    let ts = env.ledger().timestamp();
+
+    env.ledger().set_sequence_number(expiration + 1);
+
+    let result = client.try_export_audit_summary(&auditor, &company_id, &0u64, &(ts + 1_000));
+    assert_eq!(result.unwrap_err().unwrap(), AuditError::KeyExpired);
+}
+
+#[test]
+fn test_expired_key_rejects_verify_payroll_metadata() {
+    let (env, contract_id) = setup();
+    let client = AuditModuleClient::new(&env, &contract_id);
+
+    let auditor = soroban_sdk::Address::generate(&env);
+    let seq = env.ledger().sequence();
+    let expiration = seq + 5;
+    client.generate_view_key(&auditor, &expiration);
+
+    let hash = BytesN::from_array(&env, &[0xFF; 32]);
+
+    env.ledger().set_sequence_number(expiration + 1);
+
+    let result =
+        client.try_verify_payroll_metadata(&auditor, &hash, &hash, &AuditScope::FullCompany);
+    assert_eq!(result.unwrap_err().unwrap(), AuditError::KeyExpired);
+}
+
+// Boundary condition: key is still valid at exactly expiration_ledger.
+#[test]
+fn test_key_valid_at_exact_expiration_ledger() {
+    let (env, contract_id) = setup();
+    let client = AuditModuleClient::new(&env, &contract_id);
+
+    let auditor = soroban_sdk::Address::generate(&env);
+    let seq = env.ledger().sequence();
+    let expiration = seq + 10;
+    client.generate_view_key(&auditor, &expiration);
+
+    let amount: i128 = 5_000;
+    let blinding = BytesN::from_array(&env, &[0x05; 32]);
+    let stored = make_commitment(&env, amount, &blinding);
+
+    // At exactly expiration_ledger the key must still be accepted.
+    env.ledger().set_sequence_number(expiration);
+
+    assert!(client.verify_commitment_with_key(
+        &auditor,
+        &stored,
+        &amount,
+        &blinding,
+        &AuditScope::EmployeeList,
+    ));
+}
+
+// Expiry triggers an AuditAccessExpired event.
+#[test]
+fn test_expired_key_emits_audit_access_expired_event() {
+    let (env, contract_id) = setup();
+    let client = AuditModuleClient::new(&env, &contract_id);
+
+    let auditor = soroban_sdk::Address::generate(&env);
+    let seq = env.ledger().sequence();
+    let expiration = seq + 5;
+    client.generate_view_key(&auditor, &expiration);
+
+    let company_id = Symbol::new(&env, "ACME");
+    let now = env.ledger().timestamp();
+
+    env.ledger().set_sequence_number(expiration + 1);
+
+    let before = env.events().all().len();
+    let _ = client.try_generate_aggregate_report(&auditor, &company_id, &now, &(now + 1_000));
+    let after = env.events().all().len();
+
+    // At least one new event must have been emitted.
+    assert!(after > before, "expected AuditAccessExpired event");
+
+    // The last event's first topic must be the AuditAccessExpired symbol.
+    let event = env.events().all().get(after - 1).unwrap();
+    let sym: Symbol = event.1.get(0).unwrap().try_into_val(&env).unwrap();
+    assert_eq!(sym, Symbol::new(&env, "AuditAccessExpired"));
+
+    // Second topic must be the auditor address.
+    let addr: Address = event.1.get(1).unwrap().try_into_val(&env).unwrap();
+    assert_eq!(addr, auditor);
+}
+
+// ---------------------------------------------------------------------------
+// get_expiration
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_get_expiration_returns_stored_ledger() {
+    let (env, contract_id) = setup();
+    let client = AuditModuleClient::new(&env, &contract_id);
+
+    let auditor = soroban_sdk::Address::generate(&env);
+    let seq = env.ledger().sequence();
+    let expiration = seq + 1_000;
+    client.generate_view_key(&auditor, &expiration);
+
+    assert_eq!(client.get_expiration(&auditor), expiration);
+}
+
+#[test]
+fn test_get_expiration_no_key_returns_not_found() {
+    let (env, contract_id) = setup();
+    let client = AuditModuleClient::new(&env, &contract_id);
+
+    let stranger = soroban_sdk::Address::generate(&env);
+    let result = client.try_get_expiration(&stranger);
+    assert_eq!(result.unwrap_err().unwrap(), AuditError::KeyNotFound);
+}
+
+// ---------------------------------------------------------------------------
+// refresh_view_key
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_refresh_view_key_extends_expiration() {
+    let (env, contract_id) = setup();
+    let client = AuditModuleClient::new(&env, &contract_id);
+
+    let auditor = soroban_sdk::Address::generate(&env);
+    let seq = env.ledger().sequence();
+    let original_expiry = seq + 100;
+    client.generate_view_key(&auditor, &original_expiry);
+
+    let admin = contract_id.clone();
+    let new_expiry = original_expiry + 500;
+    client.refresh_view_key(&admin, &auditor, &new_expiry);
+
+    assert_eq!(client.get_expiration(&auditor), new_expiry);
+}
+
+#[test]
+fn test_refresh_view_key_rotates_key_material() {
+    let (env, contract_id) = setup();
+    let client = AuditModuleClient::new(&env, &contract_id);
+
+    let auditor = soroban_sdk::Address::generate(&env);
+    let seq = env.ledger().sequence();
+    let original_expiry = seq + 100;
+    let old_key = client.generate_view_key(&auditor, &original_expiry);
+
+    // Advance the ledger so derive_key_bytes produces distinct output.
+    env.ledger().set_sequence_number(seq + 1);
+
+    let admin = contract_id.clone();
+    let new_key = client.refresh_view_key(&admin, &auditor, &(original_expiry + 500));
+
+    assert_ne!(old_key, new_key, "refresh must rotate key material");
+    let record = client.get_view_key(&auditor);
+    assert_eq!(record.key_bytes, new_key);
+}
+
+#[test]
+fn test_refresh_view_key_emits_event() {
+    let (env, contract_id) = setup();
+    let client = AuditModuleClient::new(&env, &contract_id);
+
+    let auditor = soroban_sdk::Address::generate(&env);
+    let seq = env.ledger().sequence();
+    client.generate_view_key(&auditor, &(seq + 100));
+
+    let admin = contract_id.clone();
+    let before = env.events().all().len();
+    client.refresh_view_key(&admin, &auditor, &(seq + 600));
+    let after = env.events().all().len();
+
+    assert_eq!(after, before + 1);
+
+    let event = env.events().all().get(after - 1).unwrap();
+    let sym: Symbol = event.1.get(0).unwrap().try_into_val(&env).unwrap();
+    assert_eq!(sym, Symbol::new(&env, "ViewKeyRefreshed"));
+}
+
+#[test]
+fn test_refresh_view_key_wrong_admin_rejected() {
+    let (env, contract_id) = setup();
+    let client = AuditModuleClient::new(&env, &contract_id);
+
+    let auditor = soroban_sdk::Address::generate(&env);
+    let seq = env.ledger().sequence();
+    client.generate_view_key(&auditor, &(seq + 100));
+
+    let interloper = soroban_sdk::Address::generate(&env);
+    let result = client.try_refresh_view_key(&interloper, &auditor, &(seq + 600));
+    assert_eq!(result.unwrap_err().unwrap(), AuditError::NotKeyGranter);
+}
+
+#[test]
+fn test_refresh_view_key_no_key_returns_not_found() {
+    let (env, contract_id) = setup();
+    let client = AuditModuleClient::new(&env, &contract_id);
+
+    let stranger = soroban_sdk::Address::generate(&env);
+    let admin = contract_id.clone();
+    let result = client.try_refresh_view_key(&admin, &stranger, &1_000u32);
+    assert_eq!(result.unwrap_err().unwrap(), AuditError::KeyNotFound);
+}
+
+#[test]
+fn test_refresh_view_key_same_expiry_rejected() {
+    let (env, contract_id) = setup();
+    let client = AuditModuleClient::new(&env, &contract_id);
+
+    let auditor = soroban_sdk::Address::generate(&env);
+    let seq = env.ledger().sequence();
+    let expiry = seq + 100;
+    client.generate_view_key(&auditor, &expiry);
+
+    let admin = contract_id.clone();
+    // Same expiry — must be rejected.
+    let result = client.try_refresh_view_key(&admin, &auditor, &expiry);
+    assert_eq!(
+        result.unwrap_err().unwrap(),
+        AuditError::ExpirationNotExtended
+    );
+}
+
+#[test]
+fn test_refresh_view_key_earlier_expiry_rejected() {
+    let (env, contract_id) = setup();
+    let client = AuditModuleClient::new(&env, &contract_id);
+
+    let auditor = soroban_sdk::Address::generate(&env);
+    let seq = env.ledger().sequence();
+    let expiry = seq + 100;
+    client.generate_view_key(&auditor, &expiry);
+
+    let admin = contract_id.clone();
+    // Earlier expiry — must not truncate an active key.
+    let result = client.try_refresh_view_key(&admin, &auditor, &(expiry - 1));
+    assert_eq!(
+        result.unwrap_err().unwrap(),
+        AuditError::ExpirationNotExtended
+    );
+}
+
+#[test]
+fn test_refresh_restores_access_to_expired_key() {
+    let (env, contract_id) = setup();
+    let client = AuditModuleClient::new(&env, &contract_id);
+
+    let auditor = soroban_sdk::Address::generate(&env);
+    let seq = env.ledger().sequence();
+    let expiry = seq + 5;
+    client.generate_view_key(&auditor, &expiry);
+
+    // Expire the key.
+    env.ledger().set_sequence_number(expiry + 1);
+    assert!(!client.verify_access(&auditor));
+
+    // Refresh to a new window.
+    let admin = contract_id.clone();
+    client.refresh_view_key(&admin, &auditor, &(expiry + 500));
+
+    assert!(client.verify_access(&auditor));
+    assert_eq!(client.get_expiration(&auditor), expiry + 500);
+}
