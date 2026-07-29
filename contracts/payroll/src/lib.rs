@@ -34,6 +34,28 @@ pub enum ReconciliationStatus {
     Failed,
 }
 
+/// Canonical payroll run state shared by contracts, SDKs, and dashboards (#159).
+///
+/// This enum is the source of truth for user-visible payroll run lifecycle
+/// labels. Off-chain clients should mirror these exact names and transition
+/// rules from `docs/payroll-state-machine.md` and the JSON fixture under
+/// `fixtures/state-machine/`.
+#[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum PayrollRunState {
+    Draft = 0,
+    Validating = 1,
+    ProofPending = 2,
+    ReadyToSubmit = 3,
+    Submitted = 4,
+    Confirming = 5,
+    Completed = 6,
+    Failed = 7,
+    Cancelled = 8,
+    ReconciliationRequired = 9,
+}
+
 /// A pending payroll run that has been prepared but not yet finalized.
 /// Stores the metadata needed to execute the run without exposing salary amounts.
 ///
@@ -282,6 +304,8 @@ pub enum DataKey {
     ArchivedRun(u64),
     /// Company lifecycle state gate for payroll execution (#147).
     CompanyState,
+    /// Canonical payroll run state for SDK/dashboard conformance (#159).
+    PayrollState(u64),
     // Future upgrade example (issue #196):
     // PayrollRunV2(u64),  // Would be added here when schema evolution is needed
 }
@@ -435,6 +459,151 @@ impl Payroll {
         e.storage().persistent().set(&DataKey::RunCounter, &run_id);
 
         run_id
+    }
+
+    fn is_allowed_payroll_state_transition_internal(
+        from: PayrollRunState,
+        to: PayrollRunState,
+    ) -> bool {
+        match from {
+            PayrollRunState::Draft => matches!(
+                to,
+                PayrollRunState::Validating | PayrollRunState::Cancelled
+            ),
+            PayrollRunState::Validating => matches!(
+                to,
+                PayrollRunState::ProofPending
+                    | PayrollRunState::Failed
+                    | PayrollRunState::Cancelled
+            ),
+            PayrollRunState::ProofPending => matches!(
+                to,
+                PayrollRunState::ReadyToSubmit
+                    | PayrollRunState::Failed
+                    | PayrollRunState::Cancelled
+            ),
+            PayrollRunState::ReadyToSubmit => matches!(
+                to,
+                PayrollRunState::Submitted | PayrollRunState::Failed | PayrollRunState::Cancelled
+            ),
+            PayrollRunState::Submitted => matches!(
+                to,
+                PayrollRunState::Confirming | PayrollRunState::Failed | PayrollRunState::Cancelled
+            ),
+            PayrollRunState::Confirming => matches!(
+                to,
+                PayrollRunState::Completed
+                    | PayrollRunState::Failed
+                    | PayrollRunState::ReconciliationRequired
+            ),
+            PayrollRunState::Failed => matches!(
+                to,
+                PayrollRunState::Validating
+                    | PayrollRunState::ProofPending
+                    | PayrollRunState::Cancelled
+            ),
+            PayrollRunState::ReconciliationRequired => {
+                matches!(to, PayrollRunState::Completed | PayrollRunState::Failed)
+            }
+            PayrollRunState::Completed | PayrollRunState::Cancelled => false,
+        }
+    }
+
+    fn is_terminal_payroll_state_internal(state: PayrollRunState) -> bool {
+        matches!(state, PayrollRunState::Completed | PayrollRunState::Cancelled)
+    }
+
+    fn is_retryable_payroll_state_internal(state: PayrollRunState) -> bool {
+        matches!(state, PayrollRunState::Failed)
+    }
+
+    fn record_payroll_run_state(e: &Env, run_id: u64, state: PayrollRunState) {
+        e.storage()
+            .persistent()
+            .set(&DataKey::PayrollState(run_id), &state);
+        e.events().publish(
+            (symbol_short!("payroll"), Symbol::new(e, "run_state")),
+            (run_id, state),
+        );
+    }
+
+    fn get_payroll_run_state_internal(e: &Env, run_id: u64) -> PayrollRunState {
+        if let Some(state) = e
+            .storage()
+            .persistent()
+            .get::<_, PayrollRunState>(&DataKey::PayrollState(run_id))
+        {
+            return state;
+        }
+
+        if let Some(run) = e
+            .storage()
+            .persistent()
+            .get::<_, PayrollRun>(&DataKey::PayrollRun(run_id))
+        {
+            return match run.reconciliation_status {
+                ReconciliationStatus::Reconciled => PayrollRunState::Completed,
+                ReconciliationStatus::Unreconciled | ReconciliationStatus::Failed => {
+                    PayrollRunState::ReconciliationRequired
+                }
+            };
+        }
+
+        if e.storage().persistent().has(&DataKey::PendingRun(run_id)) {
+            return PayrollRunState::Submitted;
+        }
+
+        panic!("Payroll run state not found");
+    }
+
+    /// Return whether a transition is allowed by the canonical state machine.
+    pub fn is_payroll_state_transition_allowed(
+        _e: Env,
+        from: PayrollRunState,
+        to: PayrollRunState,
+    ) -> bool {
+        Self::is_allowed_payroll_state_transition_internal(from, to)
+    }
+
+    /// Return whether a payroll run state is terminal and immutable.
+    pub fn is_payroll_state_terminal(_e: Env, state: PayrollRunState) -> bool {
+        Self::is_terminal_payroll_state_internal(state)
+    }
+
+    /// Return whether a state should expose a retry action to clients.
+    pub fn is_payroll_state_retryable(_e: Env, state: PayrollRunState) -> bool {
+        Self::is_retryable_payroll_state_internal(state)
+    }
+
+    /// Return the canonical state for a payroll run ID.
+    pub fn get_payroll_run_state(e: Env, run_id: u64) -> PayrollRunState {
+        Self::get_payroll_run_state_internal(&e, run_id)
+    }
+
+    /// Admin-only state transition hook for conformance tests and operations.
+    pub fn transition_payroll_run_state(
+        e: Env,
+        admin: Address,
+        run_id: u64,
+        next_state: PayrollRunState,
+    ) {
+        Self::require_not_paused(&e);
+        let addrs: ContractAddresses = e
+            .storage()
+            .persistent()
+            .get(&DataKey::Addresses)
+            .expect("Not initialized");
+        if admin != addrs.admin {
+            panic!("Unauthorized");
+        }
+        admin.require_auth();
+
+        let current = Self::get_payroll_run_state_internal(&e, run_id);
+        if !Self::is_allowed_payroll_state_transition_internal(current, next_state) {
+            panic!("Invalid payroll state transition");
+        }
+
+        Self::record_payroll_run_state(&e, run_id, next_state);
     }
 
     pub fn get_payroll_run(e: Env, run_id: u64) -> PayrollRun {
@@ -758,6 +927,7 @@ impl Payroll {
         e.storage()
             .persistent()
             .set(&DataKey::PendingRun(run_id), &pending_run);
+        Self::record_payroll_run_state(&e, run_id, PayrollRunState::Submitted);
 
         e.events().publish(
             (symbol_short!("payroll"), Symbol::new(&e, "run_prepared")),
@@ -811,6 +981,7 @@ impl Payroll {
 
         // Remove the pending run from storage
         e.storage().persistent().remove(&pending_key);
+        Self::record_payroll_run_state(&e, run_id, PayrollRunState::Cancelled);
 
         // Emit cancellation event
         e.events().publish(
@@ -979,6 +1150,7 @@ impl Payroll {
         e.storage()
             .persistent()
             .set(&DataKey::PayrollRun(run_id), &run);
+        Self::record_payroll_run_state(&e, run_id, PayrollRunState::ReconciliationRequired);
 
         e.events().publish(
             (symbol_short!("payroll"), Symbol::new(&e, "run_executed")),
@@ -1103,6 +1275,19 @@ impl Payroll {
 
         run.reconciliation_status = status.clone();
         e.storage().persistent().set(&run_key, &run);
+
+        let current_state = Self::get_payroll_run_state_internal(&e, run_id);
+        let next_state = match status {
+            ReconciliationStatus::Reconciled => PayrollRunState::Completed,
+            ReconciliationStatus::Unreconciled => PayrollRunState::ReconciliationRequired,
+            ReconciliationStatus::Failed => PayrollRunState::Failed,
+        };
+        if current_state != next_state
+            && !Self::is_allowed_payroll_state_transition_internal(current_state, next_state)
+        {
+            panic!("Invalid payroll state transition");
+        }
+        Self::record_payroll_run_state(&e, run_id, next_state);
 
         e.events().publish(
             (
@@ -2401,10 +2586,45 @@ mod tests {
         let run = payroll_client.get_payroll_run(&run_id);
         assert_eq!(run.reconciliation_status, ReconciliationStatus::Reconciled);
 
-        // Update to Failed
-        payroll_client.update_reconciliation_status(&admin, &run_id, &ReconciliationStatus::Failed);
-        let run = payroll_client.get_payroll_run(&run_id);
-        assert_eq!(run.reconciliation_status, ReconciliationStatus::Failed);
+        assert_eq!(
+            payroll_client.get_payroll_run_state(&run_id),
+            PayrollRunState::Completed
+        );
+
+        let result = payroll_client.try_update_reconciliation_status(
+            &admin,
+            &run_id,
+            &ReconciliationStatus::Failed,
+        );
+        assert!(result.is_err(), "Completed runs must not be reopened");
+    }
+
+    #[test]
+    fn test_failed_reconciliation_writes_retryable_payroll_state() {
+        let env = Env::default();
+        let (payroll_client, admin, _treasury, _treasury_owner, employee) =
+            setup_simple_payroll(&env);
+
+        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
+        let run_id = payroll_client.batch_process_payroll(
+            &proofs,
+            &amounts,
+            &employees,
+            &1000,
+            &test_nonce(&env, 33),
+            &None,
+        );
+
+        payroll_client.update_reconciliation_status(
+            &admin,
+            &run_id,
+            &ReconciliationStatus::Failed,
+        );
+        assert_eq!(
+            payroll_client.get_payroll_run_state(&run_id),
+            PayrollRunState::Failed
+        );
+        assert!(payroll_client.is_payroll_state_retryable(&PayrollRunState::Failed));
     }
 
     #[test]
@@ -2447,6 +2667,159 @@ mod tests {
     }
 
     // ── Issue #75: payroll cancellation ──────────────────────────────────────
+
+    // ── Issue #159: canonical payroll state machine ──────────────────────────
+
+    #[test]
+    fn test_payroll_state_machine_allows_canonical_forward_transitions() {
+        let env = Env::default();
+        let (payroll_client, _admin, _treasury, _treasury_owner, _employee) =
+            setup_simple_payroll(&env);
+
+        assert!(payroll_client.is_payroll_state_transition_allowed(
+            &PayrollRunState::Draft,
+            &PayrollRunState::Validating,
+        ));
+        assert!(payroll_client.is_payroll_state_transition_allowed(
+            &PayrollRunState::Validating,
+            &PayrollRunState::ProofPending,
+        ));
+        assert!(payroll_client.is_payroll_state_transition_allowed(
+            &PayrollRunState::ProofPending,
+            &PayrollRunState::ReadyToSubmit,
+        ));
+        assert!(payroll_client.is_payroll_state_transition_allowed(
+            &PayrollRunState::ReadyToSubmit,
+            &PayrollRunState::Submitted,
+        ));
+        assert!(payroll_client.is_payroll_state_transition_allowed(
+            &PayrollRunState::Submitted,
+            &PayrollRunState::Confirming,
+        ));
+        assert!(payroll_client.is_payroll_state_transition_allowed(
+            &PayrollRunState::Confirming,
+            &PayrollRunState::ReconciliationRequired,
+        ));
+        assert!(payroll_client.is_payroll_state_transition_allowed(
+            &PayrollRunState::ReconciliationRequired,
+            &PayrollRunState::Completed,
+        ));
+    }
+
+    #[test]
+    fn test_payroll_state_machine_rejects_forbidden_transitions() {
+        let env = Env::default();
+        let (payroll_client, _admin, _treasury, _treasury_owner, _employee) =
+            setup_simple_payroll(&env);
+
+        assert!(!payroll_client.is_payroll_state_transition_allowed(
+            &PayrollRunState::Draft,
+            &PayrollRunState::Completed,
+        ));
+        assert!(!payroll_client.is_payroll_state_transition_allowed(
+            &PayrollRunState::Submitted,
+            &PayrollRunState::Draft,
+        ));
+        assert!(!payroll_client.is_payroll_state_transition_allowed(
+            &PayrollRunState::Completed,
+            &PayrollRunState::Failed,
+        ));
+        assert!(!payroll_client.is_payroll_state_transition_allowed(
+            &PayrollRunState::Cancelled,
+            &PayrollRunState::Submitted,
+        ));
+    }
+
+    #[test]
+    fn test_payroll_state_machine_terminal_and_retryable_metadata() {
+        let env = Env::default();
+        let (payroll_client, _admin, _treasury, _treasury_owner, _employee) =
+            setup_simple_payroll(&env);
+
+        assert!(payroll_client.is_payroll_state_terminal(&PayrollRunState::Completed));
+        assert!(payroll_client.is_payroll_state_terminal(&PayrollRunState::Cancelled));
+        assert!(!payroll_client.is_payroll_state_terminal(&PayrollRunState::Failed));
+        assert!(payroll_client.is_payroll_state_retryable(&PayrollRunState::Failed));
+        assert!(
+            !payroll_client.is_payroll_state_retryable(&PayrollRunState::ReconciliationRequired)
+        );
+    }
+
+    #[test]
+    fn test_prepare_and_cancel_write_canonical_payroll_states() {
+        let env = Env::default();
+        let (payroll_client, admin, _treasury, _treasury_owner, employee) =
+            setup_simple_payroll(&env);
+
+        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
+        let run_id = payroll_client.prepare_payroll_run(
+            &proofs,
+            &amounts,
+            &employees,
+            &1000,
+            &test_nonce(&env, 150),
+            &None,
+        );
+        assert_eq!(
+            payroll_client.get_payroll_run_state(&run_id),
+            PayrollRunState::Submitted
+        );
+
+        payroll_client.cancel_payroll_run(&admin, &run_id);
+        assert_eq!(
+            payroll_client.get_payroll_run_state(&run_id),
+            PayrollRunState::Cancelled
+        );
+    }
+
+    #[test]
+    fn test_terminal_payroll_state_cannot_be_mutated() {
+        let env = Env::default();
+        let (payroll_client, admin, _treasury, _treasury_owner, employee) =
+            setup_simple_payroll(&env);
+
+        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
+        let run_id = payroll_client.prepare_payroll_run(
+            &proofs,
+            &amounts,
+            &employees,
+            &1000,
+            &test_nonce(&env, 151),
+            &None,
+        );
+        payroll_client.cancel_payroll_run(&admin, &run_id);
+
+        let result = payroll_client.try_transition_payroll_run_state(
+            &admin,
+            &run_id,
+            &PayrollRunState::Submitted,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_non_admin_cannot_transition_payroll_state() {
+        let env = Env::default();
+        let (payroll_client, _admin, _treasury, _treasury_owner, employee) =
+            setup_simple_payroll(&env);
+
+        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
+        let run_id = payroll_client.prepare_payroll_run(
+            &proofs,
+            &amounts,
+            &employees,
+            &1000,
+            &test_nonce(&env, 152),
+            &None,
+        );
+        let attacker = Address::generate(&env);
+        let result = payroll_client.try_transition_payroll_run_state(
+            &attacker,
+            &run_id,
+            &PayrollRunState::Confirming,
+        );
+        assert!(result.is_err());
+    }
 
     #[test]
     fn test_prepare_payroll_run_creates_pending_run() {
