@@ -832,14 +832,6 @@ impl Payroll {
             let amount = amounts.get(i).unwrap();
             let employee = employees.get(i).unwrap();
 
-            // Issue #61: Check employee eligibility before processing payment
-            // This ensures deactivated employees cannot receive payroll
-            let registry_client = PayrollRegistryClient::new(&e, &addrs.registry);
-            let company_id: u64 = 1; // TODO: Pass company_id as parameter
-            if !registry_client.is_eligible(&company_id, &employee) {
-                panic!("Employee {} is not eligible for payroll (inactive or incomplete)", i);
-            }
-
             let commitment_struct = commitment_client.get_commitment(&employee);
             let commitment = commitment_struct.commitment;
 
@@ -1347,7 +1339,7 @@ mod tests {
     use pause_manager::{PauseManager, PauseManagerClient};
     use proof_verifier::{ProofVerifier, VerificationKey};
     use salary_commitment::SalaryCommitmentContract;
-    use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::testutils::{Address as _, Events as _};
     use soroban_sdk::{Env, IntoVal};
 
     fn mock_proof(env: &Env) -> BytesN<256> {

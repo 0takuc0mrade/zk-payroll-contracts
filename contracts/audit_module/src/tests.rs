@@ -879,7 +879,7 @@ fn test_verify_payroll_metadata_match_returns_true() {
         &hash,
         &AuditScope::FullCompany,
     );
-    assert!(result.unwrap());
+    assert!(result);
 }
 
 #[test]
@@ -899,7 +899,7 @@ fn test_verify_payroll_metadata_mismatch_returns_false() {
         &expected,
         &AuditScope::FullCompany,
     );
-    assert!(!result.unwrap());
+    assert!(!result);
 }
 
 #[test]
