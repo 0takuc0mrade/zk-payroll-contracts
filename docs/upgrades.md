@@ -16,6 +16,11 @@ contract storage changes.
 6. [Supported Storage Keys](#6-supported-storage-keys)
 7. [Troubleshooting](#7-troubleshooting)
 
+> **See also:** [docs/migration-notes.md](migration-notes.md) for the
+> per-contract version migration notes, step-by-step upgrade runbook, payroll
+> history and admin access preservation guidance, rollback procedure, and
+> version compatibility matrix.
+
 ---
 
 ## 1. Migration Test Framework
@@ -170,7 +175,8 @@ When introducing a breaking storage change:
    - Simulates upgrade
    - Runs migration
    - Asserts post-migration correctness
-5. **Document**: Update this file's version table.
+5. **Document**: Update this file's version table and
+   [migration-notes.md](migration-notes.md) (per-contract notes).
 
 ---
 
