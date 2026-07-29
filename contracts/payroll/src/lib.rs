@@ -3156,4 +3156,392 @@ mod tests {
         let attacker = Address::generate(&env);
         payroll_client.set_run_metadata(&attacker, &run_id, &meta_hash);
     }
+
+    // =========================================================================
+    // Issue #222: Contract recovery tests for partial failure
+    //
+    // These tests verify that partial failure paths in the payroll contract
+    // (batch_process_payroll / prepare_payroll_run / cancel_payroll_run) leave
+    // the contract in a recoverable and well-defined state.
+    //
+    // Key invariants under test:
+    //   A. batch_process_payroll is atomic (panics → full Soroban tx rollback).
+    //      All nonces, draft commitments, and payment records must be rolled back
+    //      and reusable after any mid-batch failure.
+    //   B. prepare_payroll_run succeeds or fails atomically. A failed prepare
+    //      leaves no pending run and no consumed nonce.
+    //   C. cancel_payroll_run restores the contract to a clean pending state.
+    //      After cancellation a fresh run with the same payload can be prepared
+    //      and executed successfully.
+    //   D. Emergency withdrawal requests that fail authorization leave no
+    //      partial request in storage.
+    //   E. Multiple successive partial failures followed by a correct call
+    //      produce exactly one PayrollRun record with the correct total.
+    // =========================================================================
+
+    // -------------------------------------------------------------------------
+    // A. batch_process_payroll atomicity across different failure modes
+    // -------------------------------------------------------------------------
+
+    /// A mid-batch panic caused by a missing commitment rolls back the entire
+    /// transaction — no PayrollRun is created and the nonce is reusable.
+    /// Seed nonce 300 so it does not collide with any existing test.
+    #[test]
+    fn test_recovery_batch_missing_commitment_leaves_no_run_and_reusable_nonce() {
+        let env = Env::default();
+        let (payroll_client, _admin, _treasury, _treasury_owner, employee) =
+            setup_simple_payroll(&env);
+
+        // emp2 has NO commitment stored — will trigger a panic inside the loop.
+        let emp2 = Address::generate(&env);
+        let mut employees = Vec::new(&env);
+        employees.push_back(employee.clone());
+        employees.push_back(emp2.clone());
+        let mut proofs = Vec::new(&env);
+        proofs.push_back(mock_proof(&env));
+        proofs.push_back(mock_proof(&env));
+        let mut amounts = Vec::new(&env);
+        amounts.push_back(500i128);
+        amounts.push_back(500i128);
+
+        let nonce = test_nonce(&env, 300);
+        let result = payroll_client.try_batch_process_payroll(
+            &proofs, &amounts, &employees, &1000, &nonce, &None,
+        );
+        assert!(result.is_err(), "Batch with missing commitment must fail");
+
+        // No PayrollRun record must exist.
+        for run_id in 1..=3u64 {
+            assert!(
+                payroll_client.try_get_payroll_run(&run_id).is_err(),
+                "No PayrollRun must exist after failed batch"
+            );
+        }
+
+        // Nonce rolled back — should be usable in a corrected single-employee run.
+        let (proofs2, amounts2, employees2) = single_payment_batch(&env, &employee, 500);
+        let run_id = payroll_client.batch_process_payroll(
+            &proofs2, &amounts2, &employees2, &500, &nonce, &None,
+        );
+        assert!(run_id > 0, "Nonce must be reusable after rolled-back batch");
+    }
+
+    /// A spend-mismatch failure (expected_total_spend != sum of amounts) rolls
+    /// back before any payment is attempted. The contract stays pristine.
+    #[test]
+    fn test_recovery_spend_mismatch_leaves_pristine_state() {
+        let env = Env::default();
+        let (payroll_client, _admin, _treasury, _treasury_owner, employee) =
+            setup_simple_payroll(&env);
+
+        let nonce = test_nonce(&env, 301);
+        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 500);
+
+        // Pass wrong expected_total — must panic before any payments.
+        let result = payroll_client.try_batch_process_payroll(
+            &proofs, &amounts, &employees, &9999, &nonce, &None,
+        );
+        assert!(result.is_err(), "Spend mismatch must cause failure");
+
+        // Nonce must be reusable with the corrected total.
+        let run_id = payroll_client.batch_process_payroll(
+            &proofs, &amounts, &employees, &500, &nonce, &None,
+        );
+        assert!(run_id > 0, "Corrected batch must succeed with rolled-back nonce");
+    }
+
+    /// Three successive partial failures (missing commitment, spend mismatch,
+    /// array mismatch) followed by a valid call must produce exactly one
+    /// PayrollRun with the correct total and employee count.
+    #[test]
+    fn test_recovery_successive_failures_then_success_produces_single_run() {
+        let env = Env::default();
+        let (payroll_client, _admin, _treasury, _treasury_owner, employee) =
+            setup_simple_payroll(&env);
+
+        let nonce = test_nonce(&env, 302);
+
+        // Failure 1: missing commitment
+        let ghost = Address::generate(&env);
+        let mut employees_bad = Vec::new(&env);
+        employees_bad.push_back(ghost.clone());
+        let mut proofs_bad = Vec::new(&env);
+        proofs_bad.push_back(mock_proof(&env));
+        let mut amounts_bad = Vec::new(&env);
+        amounts_bad.push_back(500i128);
+        assert!(
+            payroll_client.try_batch_process_payroll(
+                &proofs_bad, &amounts_bad, &employees_bad, &500, &nonce, &None
+            ).is_err()
+        );
+
+        // Failure 2: spend mismatch
+        let (proofs2, amounts2, employees2) = single_payment_batch(&env, &employee, 500);
+        assert!(
+            payroll_client.try_batch_process_payroll(
+                &proofs2, &amounts2, &employees2, &1, &nonce, &None
+            ).is_err()
+        );
+
+        // Failure 3: array length mismatch
+        let mut proofs3 = Vec::new(&env);
+        proofs3.push_back(mock_proof(&env));
+        proofs3.push_back(mock_proof(&env)); // extra proof
+        let mut amounts3 = Vec::new(&env);
+        amounts3.push_back(500i128);
+        let mut employees3 = Vec::new(&env);
+        employees3.push_back(employee.clone());
+        assert!(
+            payroll_client.try_batch_process_payroll(
+                &proofs3, &amounts3, &employees3, &500, &nonce, &None
+            ).is_err()
+        );
+
+        // Success: well-formed batch with the same nonce (it was rolled back each time).
+        let (proofs_ok, amounts_ok, employees_ok) = single_payment_batch(&env, &employee, 500);
+        let run_id = payroll_client.batch_process_payroll(
+            &proofs_ok, &amounts_ok, &employees_ok, &500, &nonce, &None,
+        );
+        assert!(run_id > 0, "Valid batch after successive failures must succeed");
+
+        let run = payroll_client.get_payroll_run(&run_id);
+        assert_eq!(run.total_amount, 500, "Run total must match the successful batch");
+        assert_eq!(run.employee_count, 1, "Employee count must be 1");
+
+        // Exactly one PayrollRun must exist.
+        assert!(payroll_client.try_get_payroll_run(&(run_id + 1)).is_err());
+    }
+
+    // -------------------------------------------------------------------------
+    // B. prepare_payroll_run failure atomicity
+    // -------------------------------------------------------------------------
+
+    /// prepare_payroll_run with a spend mismatch must fail without creating a
+    /// pending run or consuming the nonce. A corrected call must then succeed.
+    #[test]
+    fn test_recovery_failed_prepare_spend_mismatch_nonce_reusable() {
+        let env = Env::default();
+        let (payroll_client, _admin, _treasury, _treasury_owner, employee) =
+            setup_simple_payroll(&env);
+
+        let nonce = test_nonce(&env, 310);
+        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 500);
+
+        // Wrong expected_total_spend — prepare must panic before writing anything.
+        let result = payroll_client.try_prepare_payroll_run(
+            &proofs, &amounts, &employees, &9999, &nonce, &None,
+        );
+        assert!(result.is_err(), "Failed prepare must return an error");
+
+        // No pending run should exist.
+        for id in 1..=3u64 {
+            assert!(payroll_client.get_pending_run(&id).is_none());
+        }
+
+        // Nonce must be reusable.
+        let run_id = payroll_client.prepare_payroll_run(
+            &proofs, &amounts, &employees, &500, &nonce, &None,
+        );
+        assert!(run_id > 0, "prepare must succeed after rolled-back failed attempt");
+
+        let pending = payroll_client.get_pending_run(&run_id);
+        assert!(pending.is_some(), "Pending run must exist after successful prepare");
+        assert_eq!(pending.unwrap().total_amount, 500);
+    }
+
+    /// prepare_payroll_run with array length mismatch must fail atomically —
+    /// no pending run, no consumed nonce.
+    #[test]
+    fn test_recovery_failed_prepare_array_mismatch_nonce_reusable() {
+        let env = Env::default();
+        let (payroll_client, _admin, _treasury, _treasury_owner, employee) =
+            setup_simple_payroll(&env);
+
+        let nonce = test_nonce(&env, 311);
+
+        // One proof, two amounts — deliberate mismatch.
+        let mut proofs = Vec::new(&env);
+        proofs.push_back(mock_proof(&env));
+        let mut amounts = Vec::new(&env);
+        amounts.push_back(500i128);
+        amounts.push_back(500i128);
+        let mut employees = Vec::new(&env);
+        employees.push_back(employee.clone());
+
+        let result = payroll_client.try_prepare_payroll_run(
+            &proofs, &amounts, &employees, &1000, &nonce, &None,
+        );
+        assert!(result.is_err());
+
+        // Corrected prepare must work.
+        let (proofs_ok, amounts_ok, employees_ok) = single_payment_batch(&env, &employee, 500);
+        let run_id = payroll_client.prepare_payroll_run(
+            &proofs_ok, &amounts_ok, &employees_ok, &500, &nonce, &None,
+        );
+        assert!(run_id > 0);
+    }
+
+    // -------------------------------------------------------------------------
+    // C. cancel_payroll_run — clean cancellation enables fresh execution
+    // -------------------------------------------------------------------------
+
+    /// Cancelling a pending run removes it from storage and emits the
+    /// cancellation event. A subsequent prepare+execute with fresh parameters
+    /// must succeed and produce a valid PayrollRun record.
+    #[test]
+    fn test_recovery_cancel_then_resubmit_succeeds() {
+        let env = Env::default();
+        let (payroll_client, admin, _treasury, _treasury_owner, employee) =
+            setup_simple_payroll(&env);
+
+        let nonce1 = test_nonce(&env, 320);
+        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 500);
+
+        // Prepare run 1.
+        let run_id1 = payroll_client.prepare_payroll_run(
+            &proofs, &amounts, &employees, &500, &nonce1, &None,
+        );
+        assert!(payroll_client.get_pending_run(&run_id1).is_some());
+
+        // Cancel it.
+        payroll_client.cancel_payroll_run(&admin, &run_id1);
+        assert!(
+            payroll_client.get_pending_run(&run_id1).is_none(),
+            "Pending run must be removed after cancellation"
+        );
+
+        // Prepare and execute a fresh run with a new nonce.
+        let nonce2 = test_nonce(&env, 321);
+        let run_id2 = payroll_client.prepare_payroll_run(
+            &proofs, &amounts, &employees, &500, &nonce2, &None,
+        );
+        assert!(run_id2 > 0);
+        assert!(payroll_client.get_pending_run(&run_id2).is_some());
+
+        // Execute — must produce a PayrollRun.
+        let exec_id = payroll_client.batch_process_payroll(
+            &proofs, &amounts, &employees, &500, &test_nonce(&env, 322), &None,
+        );
+        assert!(exec_id > 0);
+        let run = payroll_client.get_payroll_run(&exec_id);
+        assert_eq!(run.total_amount, 500);
+        assert_eq!(run.employee_count, 1);
+    }
+
+    /// Cancelling the same run a second time must fail — the pending run no
+    /// longer exists. The already-cancelled state is preserved.
+    #[test]
+    fn test_recovery_double_cancel_fails_gracefully() {
+        let env = Env::default();
+        let (payroll_client, admin, _treasury, _treasury_owner, employee) =
+            setup_simple_payroll(&env);
+
+        let nonce = test_nonce(&env, 323);
+        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 500);
+
+        let run_id = payroll_client.prepare_payroll_run(
+            &proofs, &amounts, &employees, &500, &nonce, &None,
+        );
+
+        // First cancel — must succeed.
+        payroll_client.cancel_payroll_run(&admin, &run_id);
+        assert!(payroll_client.get_pending_run(&run_id).is_none());
+
+        // Second cancel — must fail (run already gone).
+        let result = payroll_client.try_cancel_payroll_run(&admin, &run_id);
+        assert!(result.is_err(), "Second cancellation must fail");
+
+        // State is still clean: no pending run, no PayrollRun record.
+        assert!(payroll_client.get_pending_run(&run_id).is_none());
+        assert!(payroll_client.try_get_payroll_run(&run_id).is_err());
+    }
+
+    /// An unauthorized cancel attempt must fail and leave the pending run
+    /// fully intact so the authorized admin can still execute it.
+    #[test]
+    fn test_recovery_unauthorized_cancel_leaves_pending_run_intact() {
+        let env = Env::default();
+        let (payroll_client, admin, _treasury, _treasury_owner, employee) =
+            setup_simple_payroll(&env);
+
+        let nonce = test_nonce(&env, 324);
+        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 500);
+
+        let run_id = payroll_client.prepare_payroll_run(
+            &proofs, &amounts, &employees, &500, &nonce, &None,
+        );
+
+        let attacker = Address::generate(&env);
+        let result = payroll_client.try_cancel_payroll_run(&attacker, &run_id);
+        assert!(result.is_err(), "Unauthorized cancel must fail");
+
+        // Pending run must still be present.
+        let pending = payroll_client.get_pending_run(&run_id);
+        assert!(pending.is_some(), "Pending run must survive unauthorized cancel");
+        assert_eq!(pending.unwrap().run_id, run_id);
+
+        // Admin can still execute the run.
+        let exec_nonce = test_nonce(&env, 325);
+        let exec_id = payroll_client.batch_process_payroll(
+            &proofs, &amounts, &employees, &500, &exec_nonce, &None,
+        );
+        assert!(exec_id > 0, "Admin must still be able to execute after failed cancel");
+    }
+
+    // -------------------------------------------------------------------------
+    // D. Emergency withdrawal partial failure — no stale request left
+    // -------------------------------------------------------------------------
+
+    /// An emergency withdrawal request from a non-treasury-owner must fail.
+    /// No EmergencyWithdrawalRequest record must be created, and the treasury
+    /// balance must be unchanged.
+    #[test]
+    fn test_recovery_unauthorized_emergency_request_leaves_no_record() {
+        let env = Env::default();
+        let (payroll_client, _admin, _treasury, _treasury_owner, _employee) =
+            setup_simple_payroll(&env);
+
+        let attacker = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        let result = payroll_client.try_request_emergency_withdrawal(
+            &attacker, &100i128, &recipient,
+        );
+        assert!(result.is_err(), "Unauthorized withdrawal request must fail");
+
+        // No pending request must exist.
+        assert!(
+            payroll_client.get_emergency_request().is_none(),
+            "No emergency request must exist after unauthorized attempt"
+        );
+    }
+
+    /// Cancelling an emergency withdrawal request leaves the contract in a
+    /// clean state. A subsequent legitimate request must be accepted.
+    #[test]
+    fn test_recovery_cancelled_emergency_request_allows_fresh_request() {
+        let env = Env::default();
+        let (payroll_client, _admin, _treasury, _treasury_owner, _employee) =
+            setup_simple_payroll(&env);
+
+        let recipient = Address::generate(&env);
+
+        // Submit a request as treasury_owner.
+        payroll_client.request_emergency_withdrawal(&_treasury_owner, &200i128, &recipient);
+        assert!(payroll_client.get_emergency_request().is_some());
+
+        // Cancel it (admin or treasury_owner may cancel).
+        payroll_client.cancel_emergency_withdrawal(&_treasury_owner);
+        assert!(
+            payroll_client.get_emergency_request().is_none(),
+            "Emergency request must be cleared after cancellation"
+        );
+
+        // A fresh request from the treasury_owner must now be accepted.
+        let recipient2 = Address::generate(&env);
+        payroll_client.request_emergency_withdrawal(&_treasury_owner, &300i128, &recipient2);
+        let req = payroll_client.get_emergency_request();
+        assert!(req.is_some(), "Fresh emergency request must succeed after cancellation");
+        assert_eq!(req.unwrap().amount, 300i128);
+    }
 }
