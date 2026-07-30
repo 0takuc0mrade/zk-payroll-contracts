@@ -770,3 +770,74 @@ fn test_admin_cannot_accept_treasury_rotation_in_place_of_proposed_treasury() {
     client.propose_treasury_rotation(&company_id, &admin, &new_treasury);
     client.accept_treasury_rotation(&company_id, &admin);
 }
+
+#[test]
+fn test_propose_treasury_rotation_emits_event() {
+    let (env, contract_id) = setup();
+    let client = PayrollRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let company_id = client.register_company(&admin, &treasury);
+    let new_treasury = Address::generate(&env);
+
+    let before = env.events().all().len();
+    client.propose_treasury_rotation(&company_id, &admin, &new_treasury);
+    let after = env.events().all().len();
+    assert_eq!(after, before + 1);
+
+    let event = env.events().all().get(after - 1).unwrap();
+    let sym0: Symbol = event.1.get(0).unwrap().try_into_val(&env.clone()).unwrap();
+    assert_eq!(sym0, Symbol::new(&env, "TreasuryRotationProposed"));
+    let comp_id: u64 = event.1.get(1).unwrap().try_into_val(&env.clone()).unwrap();
+    assert_eq!(comp_id, company_id);
+}
+
+#[test]
+fn test_accept_treasury_rotation_emits_event() {
+    let (env, contract_id) = setup();
+    let client = PayrollRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let company_id = client.register_company(&admin, &treasury);
+    let new_treasury = Address::generate(&env);
+
+    client.propose_treasury_rotation(&company_id, &admin, &new_treasury);
+
+    let before = env.events().all().len();
+    client.accept_treasury_rotation(&company_id, &new_treasury);
+    let after = env.events().all().len();
+    assert_eq!(after, before + 1);
+
+    let event = env.events().all().get(after - 1).unwrap();
+    let sym0: Symbol = event.1.get(0).unwrap().try_into_val(&env.clone()).unwrap();
+    assert_eq!(sym0, Symbol::new(&env, "TreasuryRotated"));
+    let comp_id: u64 = event.1.get(1).unwrap().try_into_val(&env.clone()).unwrap();
+    assert_eq!(comp_id, company_id);
+
+    let company = client.get_company(&company_id);
+    assert_eq!(company.treasury, new_treasury);
+}
+
+#[test]
+fn test_cancel_treasury_rotation_emits_event() {
+    let (env, contract_id) = setup();
+    let client = PayrollRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let company_id = client.register_company(&admin, &treasury);
+    let new_treasury = Address::generate(&env);
+
+    client.propose_treasury_rotation(&company_id, &admin, &new_treasury);
+
+    let before = env.events().all().len();
+    client.cancel_treasury_rotation(&company_id, &admin);
+    let after = env.events().all().len();
+    assert_eq!(after, before + 1);
+
+    let event = env.events().all().get(after - 1).unwrap();
+    let sym0: Symbol = event.1.get(0).unwrap().try_into_val(&env.clone()).unwrap();
+    assert_eq!(sym0, Symbol::new(&env, "TreasuryRotationCancelled"));
+    let comp_id: u64 = event.1.get(1).unwrap().try_into_val(&env.clone()).unwrap();
+    assert_eq!(comp_id, company_id);
+}
+

@@ -9,7 +9,7 @@ use payroll_registry::{CompanyInfo, PayrollRegistryClient};
 use proof_verifier::{Groth16Proof, ProofVerifierClient};
 use salary_commitment::SalaryCommitmentContractClient;
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, token, Address, BytesN, Env,
+    contract, contracterror, contractimpl, contracttype, token, Address, BytesN, Env, Symbol,
 };
 
 /// Maximum age for a proof relative to its period creation time (7 days in seconds).
@@ -140,6 +140,14 @@ impl PaymentExecutor {
         env.storage()
             .persistent()
             .set(&DataKey::StorageVersion, &1u32);
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "TreasuryAssetAllowedUpdated"),
+                addresses.token.clone(),
+            ),
+            (true, env.ledger().timestamp()),
+        );
     }
 
 
@@ -180,7 +188,14 @@ impl PaymentExecutor {
         env.storage()
             .persistent()
             .set(&DataKey::AllowedAsset(asset.clone()), &allowed);
-        payroll_events::emit_asset_allowed_changed(&env, asset, allowed);
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "TreasuryAssetAllowedUpdated"),
+                asset,
+            ),
+            (allowed, env.ledger().timestamp()),
+        );
     }
 
     /// Check if an asset token is allowlisted for payments (issue #175).
@@ -1324,4 +1339,36 @@ mod tests {
 
         assert_eq!(client.get_storage_version(), 1);
     }
+
+    #[test]
+    fn test_asset_allowed_emits_events() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, PaymentExecutor);
+        let client = PaymentExecutorClient::new(&env, &contract_id);
+
+        let addresses = setup_addresses(&env);
+        let before_init = env.events().all().len();
+        client.initialize(&addresses);
+        let after_init = env.events().all().len();
+        assert_eq!(after_init, before_init + 1);
+
+        let init_event = env.events().all().get(after_init - 1).unwrap();
+        let sym0: Symbol = init_event.1.get(0).unwrap().try_into_val(&env.clone()).unwrap();
+        assert_eq!(sym0, Symbol::new(&env, "TreasuryAssetAllowedUpdated"));
+
+        let executor_admin = Address::generate(&env);
+        client.set_executor_admin(&executor_admin);
+
+        let before_set = env.events().all().len();
+        let new_asset = Address::generate(&env);
+        client.set_asset_allowed(&new_asset, &true);
+        let after_set = env.events().all().len();
+        assert_eq!(after_set, before_set + 1);
+
+        let set_event = env.events().all().get(after_set - 1).unwrap();
+        let set_sym0: Symbol = set_event.1.get(0).unwrap().try_into_val(&env.clone()).unwrap();
+        assert_eq!(set_sym0, Symbol::new(&env, "TreasuryAssetAllowedUpdated"));
+    }
 }
+

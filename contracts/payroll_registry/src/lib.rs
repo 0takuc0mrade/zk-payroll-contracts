@@ -158,6 +158,9 @@ pub trait PayrollRegistryTrait {
 
     /// Accept a pending treasury rotation (step 2 of 2).
     fn accept_treasury_rotation(env: Env, company_id: u64, new_treasury: Address);
+
+    /// Cancel a pending treasury rotation.
+    fn cancel_treasury_rotation(env: Env, company_id: u64, current_admin: Address);
 }
 
 // ---------------------------------------------------------------------------
@@ -629,11 +632,10 @@ impl PayrollRegistryTrait for PayrollRegistry {
         env.storage()
             .persistent()
             .set(&DataKey::PendingTreasuryRotation(company_id), &proposal);
-        payroll_events::emit_company_treasury_proposed(
-            &env,
-            company_id,
-            current_admin,
-            new_treasury,
+
+        env.events().publish(
+            (Symbol::new(&env, "TreasuryRotationProposed"), company_id),
+            (current_admin, new_treasury, env.ledger().timestamp()),
         );
     }
 
@@ -657,6 +659,7 @@ impl PayrollRegistryTrait for PayrollRegistry {
             .expect("Company not found");
 
         let old_treasury = info.treasury.clone();
+
         info.treasury = new_treasury.clone();
         env.storage()
             .persistent()
@@ -664,7 +667,40 @@ impl PayrollRegistryTrait for PayrollRegistry {
         env.storage()
             .persistent()
             .remove(&DataKey::PendingTreasuryRotation(company_id));
-        payroll_events::emit_company_treasury_rotated(&env, company_id, old_treasury, new_treasury);
+
+        env.events().publish(
+            (Symbol::new(&env, "TreasuryRotated"), company_id),
+            (old_treasury, new_treasury),
+        );
+    }
+
+    fn cancel_treasury_rotation(env: Env, company_id: u64, current_admin: Address) {
+        Self::require_not_paused(&env);
+        let info: CompanyInfo = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Company(company_id))
+            .expect("Company not found");
+        if current_admin != info.admin {
+            panic!("Unauthorized");
+        }
+        current_admin.require_auth();
+
+        if !env
+            .storage()
+            .persistent()
+            .has(&DataKey::PendingTreasuryRotation(company_id))
+        {
+            panic!("No pending treasury rotation to cancel");
+        }
+        env.storage()
+            .persistent()
+            .remove(&DataKey::PendingTreasuryRotation(company_id));
+
+        env.events().publish(
+            (Symbol::new(&env, "TreasuryRotationCancelled"), company_id),
+            (current_admin,),
+        );
     }
 }
 
