@@ -717,7 +717,10 @@ fn test_failed_execution_leaves_commitments_reusable_and_unmutated() {
         &nullifier,
         &99,
     );
-    assert_eq!(invalid_period_res.unwrap_err().unwrap(), PaymentError::PeriodNotFound);
+    assert_eq!(
+        invalid_period_res.unwrap_err().unwrap(),
+        PaymentError::PeriodNotFound
+    );
 
     // Verify state was completely unmutated
     assert!(!executor.is_paid(&employee, &1));
@@ -745,4 +748,3 @@ fn test_failed_execution_leaves_commitments_reusable_and_unmutated() {
     assert_eq!(executor.get_total_paid(&company_id), 1000);
     assert_eq!(token.balance(&employee), 1000);
 }
-

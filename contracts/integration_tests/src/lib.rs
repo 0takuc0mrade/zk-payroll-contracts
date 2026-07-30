@@ -516,7 +516,8 @@ mod e2e {
 
         // ── PHASE 4: Commit and bind metadata hash ───────────────────────────
         let meta_hash = BytesN::from_array(env, &[0xAB; 32]);
-        ctx.payroll_client.commit_metadata_hash(&ctx.admin, &meta_hash);
+        ctx.payroll_client
+            .commit_metadata_hash(&ctx.admin, &meta_hash);
         ctx.payroll_client
             .set_run_metadata(&ctx.admin, &run_id, &meta_hash);
 
@@ -527,8 +528,11 @@ mod e2e {
 
         // ── PHASE 6: Verify mismatch detection ───────────────────────────────
         let wrong_hash = BytesN::from_array(env, &[0xCD; 32]);
-        assert!(!ctx.payroll_client.verify_metadata_hash(&run_id, &wrong_hash));
+        assert!(!ctx
+            .payroll_client
+            .verify_metadata_hash(&run_id, &wrong_hash));
     }
+
 
     /// Issue #201: Verify end-to-end failed payroll execution rollback across all contracts.
     /// Ensures partial state is not retained in SalaryCommitment, Registry, Token, or Payroll.
