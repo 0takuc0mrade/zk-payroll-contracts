@@ -89,7 +89,13 @@ impl PauseManager {
             .persistent()
             .set(&DataKey::PendingOperator, &proposal);
 
-        payroll_events::emit_pause_operator_proposed(&e, current_operator, new_operator);
+        e.events().publish(
+            (
+                Symbol::new(&e, "PauseManager"),
+                Symbol::new(&e, "op_proposed"),
+            ),
+            (current_operator, new_operator),
+        );
     }
 
     pub fn accept_operator_rotation(e: Env, new_operator: Address) {
@@ -109,7 +115,13 @@ impl PauseManager {
             .set(&DataKey::Operator, &new_operator);
         e.storage().persistent().remove(&DataKey::PendingOperator);
 
-        payroll_events::emit_pause_operator_rotated(&e, new_operator);
+        e.events().publish(
+            (
+                Symbol::new(&e, "PauseManager"),
+                Symbol::new(&e, "op_rotated"),
+            ),
+            new_operator,
+        );
     }
 
     pub fn cancel_operator_rotation(e: Env, current_operator: Address) {
@@ -128,7 +140,13 @@ impl PauseManager {
         }
         e.storage().persistent().remove(&DataKey::PendingOperator);
 
-        payroll_events::emit_pause_operator_cancelled(&e, current_operator);
+        e.events().publish(
+            (
+                Symbol::new(&e, "PauseManager"),
+                Symbol::new(&e, "op_cancelled"),
+            ),
+            current_operator,
+        );
     }
 
     pub fn get_pending_operator_rotation(e: Env) -> Option<PendingOperatorRotation> {
@@ -232,10 +250,11 @@ impl<'a> PauseManagerClient<'a> {
         self.0.invoke_contract(
             &self.1,
             &Symbol::new(self.0, "get_pending_operator_rotation"),
-            Self::empty_args(self.0),
+            (),
         )
     }
 }
+
 
 #[cfg(test)]
 mod tests {

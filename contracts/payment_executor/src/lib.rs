@@ -1,5 +1,8 @@
 #![no_std]
 
+extern crate alloc;
+use alloc::format;
+
 use pause_manager::PauseManagerClient;
 use payroll_events;
 use payroll_registry::{CompanyInfo, PayrollRegistryClient};
@@ -137,13 +140,8 @@ impl PaymentExecutor {
         env.storage()
             .persistent()
             .set(&DataKey::StorageVersion, &1u32);
-
-        payroll_events::emit_executor_initialized(
-            &env,
-            addresses.registry.clone(),
-            addresses.token.clone(),
-        );
     }
+
 
     /// Set the executor-level admin (one-time, protected by auth).
     pub fn set_executor_admin(env: Env, admin: Address) {
@@ -396,9 +394,9 @@ impl PaymentExecutor {
         if token_str.is_empty() {
             panic!("Invalid treasury asset mapping: empty token address");
         }
-        
+
         // Verify the treasury address is properly configured and matches asset type
-        let treasury_str = format!("{:?}", addresses.treasury);
+        let treasury_str = format!("{:?}", company.treasury);
         if treasury_str.is_empty() {
             panic!("Invalid treasury mapping: empty treasury address");
         }
