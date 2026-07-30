@@ -421,12 +421,9 @@ impl Payroll {
 
         // Issue #62: accumulate per-depositor balance for auditability.
         let balance_key = DataKey::CompanyBalance(from.clone());
-        let prev_balance: i128 = e
-            .storage()
-            .persistent()
-            .get(&balance_key)
-            .unwrap_or(0i128);
+        let prev_balance: i128 = e.storage().persistent().get(&balance_key).unwrap_or(0i128);
         let new_balance = prev_balance + amount;
+
         e.storage().persistent().set(&balance_key, &new_balance);
 
         e.events().publish(
@@ -465,10 +462,9 @@ impl Payroll {
         to: PayrollRunState,
     ) -> bool {
         match from {
-            PayrollRunState::Draft => matches!(
-                to,
-                PayrollRunState::Validating | PayrollRunState::Cancelled
-            ),
+            PayrollRunState::Draft => {
+                matches!(to, PayrollRunState::Validating | PayrollRunState::Cancelled)
+            }
             PayrollRunState::Validating => matches!(
                 to,
                 PayrollRunState::ProofPending
@@ -509,8 +505,12 @@ impl Payroll {
     }
 
     fn is_terminal_payroll_state_internal(state: PayrollRunState) -> bool {
-        matches!(state, PayrollRunState::Completed | PayrollRunState::Cancelled)
+        matches!(
+            state,
+            PayrollRunState::Completed | PayrollRunState::Cancelled
+        )
     }
+
 
     fn is_retryable_payroll_state_internal(state: PayrollRunState) -> bool {
         matches!(state, PayrollRunState::Failed)
@@ -1224,14 +1224,38 @@ impl Payroll {
         new_employee_count: u32,
     ) {
         Self::require_not_paused(&e);
-        let addrs: ContractAddresses = e.storage().persistent().get(&DataKey::Addresses).expect("Not initialized");
-        if admin != addrs.admin { panic!("Unauthorized"); }
+        let addrs: ContractAddresses = e
+            .storage()
+            .persistent()
+            .get(&DataKey::Addresses)
+            .expect("Not initialized");
+        if admin != addrs.admin {
+            panic!("Unauthorized");
+        }
         admin.require_auth();
-        let mut draft: PayrollRunDraft = e.storage().persistent().get(&DataKey::RunDraft(draft_id)).expect("Draft not found");
-        if draft.state != RunDraftState::Pending { panic!("Only pending drafts can be amended"); }
-        if new_total_amount <= 0 { panic!("total_amount must be positive"); }
-        draft.total_amount=new_total_amount; draft.employee_count=new_employee_count; draft.amendment_count+=1; e.storage().persistent().set(&DataKey::RunDraft(draft_id), &draft); e.events().publish((symbol_short!("payroll"), Symbol::new(&e,"draft_amended")),(draft_id,new_total_amount,draft.amendment_count));
+        let mut draft: PayrollRunDraft = e
+            .storage()
+            .persistent()
+            .get(&DataKey::RunDraft(draft_id))
+            .expect("Draft not found");
+        if draft.state != RunDraftState::Pending {
+            panic!("Only pending drafts can be amended");
+        }
+        if new_total_amount <= 0 {
+            panic!("total_amount must be positive");
+        }
+        draft.total_amount = new_total_amount;
+        draft.employee_count = new_employee_count;
+        draft.amendment_count += 1;
+        e.storage()
+            .persistent()
+            .set(&DataKey::RunDraft(draft_id), &draft);
+        e.events().publish(
+            (symbol_short!("payroll"), Symbol::new(&e, "draft_amended")),
+            (draft_id, new_total_amount, draft.amendment_count),
+        );
     }
+
 
     /// Update the reconciliation status of a completed payroll run.
     ///
@@ -1619,9 +1643,7 @@ impl Payroll {
             panic!("Unauthorized");
         }
         admin.require_auth();
-        e.storage()
-            .persistent()
-            .set(&DataKey::CompanyState, &state);
+        e.storage().persistent().set(&DataKey::CompanyState, &state);
         e.events().publish(
             (symbol_short!("payroll"), Symbol::new(&e, "state_changed")),
             state,
@@ -1656,11 +1678,7 @@ impl Payroll {
         admin.require_auth();
 
         // Ensure the run exists before archiving it.
-        if !e
-            .storage()
-            .persistent()
-            .has(&DataKey::PayrollRun(run_id))
-        {
+        if !e.storage().persistent().has(&DataKey::PayrollRun(run_id)) {
             panic!("Run not found");
         }
 
@@ -1682,11 +1700,7 @@ impl Payroll {
     /// panics for runs that exist but have not been archived, keeping the
     /// archived and active access paths clearly separated.
     pub fn get_archived_run(e: Env, run_id: u64) -> PayrollRun {
-        if !e
-            .storage()
-            .persistent()
-            .has(&DataKey::ArchivedRun(run_id))
-        {
+        if !e.storage().persistent().has(&DataKey::ArchivedRun(run_id)) {
             panic!("Run is not archived");
         }
         e.storage()
@@ -1694,6 +1708,7 @@ impl Payroll {
             .get(&DataKey::PayrollRun(run_id))
             .expect("Run not found")
     }
+
 
     /// Return `true` if the run has been marked as archived, `false` otherwise.
     pub fn is_run_archived(e: Env, run_id: u64) -> bool {
