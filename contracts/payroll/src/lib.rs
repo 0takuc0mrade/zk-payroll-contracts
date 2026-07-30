@@ -5,7 +5,6 @@ use soroban_sdk::{
 };
 
 use pause_manager::PauseManagerClient;
-use payroll_registry::PayrollRegistryClient;
 use proof_verifier::ProofVerifierClient;
 use salary_commitment::SalaryCommitmentContractClient;
 
@@ -557,7 +556,7 @@ impl Payroll {
     }
 
     /// Return whether a transition is allowed by the canonical state machine.
-    pub fn is_payroll_state_transition_allowed(
+    pub fn is_state_transition_allowed(
         _e: Env,
         from: PayrollRunState,
         to: PayrollRunState,
@@ -2668,31 +2667,31 @@ mod tests {
         let (payroll_client, _admin, _treasury, _treasury_owner, _employee) =
             setup_simple_payroll(&env);
 
-        assert!(payroll_client.is_payroll_state_transition_allowed(
+        assert!(payroll_client.is_state_transition_allowed(
             &PayrollRunState::Draft,
             &PayrollRunState::Validating,
         ));
-        assert!(payroll_client.is_payroll_state_transition_allowed(
+        assert!(payroll_client.is_state_transition_allowed(
             &PayrollRunState::Validating,
             &PayrollRunState::ProofPending,
         ));
-        assert!(payroll_client.is_payroll_state_transition_allowed(
+        assert!(payroll_client.is_state_transition_allowed(
             &PayrollRunState::ProofPending,
             &PayrollRunState::ReadyToSubmit,
         ));
-        assert!(payroll_client.is_payroll_state_transition_allowed(
+        assert!(payroll_client.is_state_transition_allowed(
             &PayrollRunState::ReadyToSubmit,
             &PayrollRunState::Submitted,
         ));
-        assert!(payroll_client.is_payroll_state_transition_allowed(
+        assert!(payroll_client.is_state_transition_allowed(
             &PayrollRunState::Submitted,
             &PayrollRunState::Confirming,
         ));
-        assert!(payroll_client.is_payroll_state_transition_allowed(
+        assert!(payroll_client.is_state_transition_allowed(
             &PayrollRunState::Confirming,
             &PayrollRunState::ReconciliationRequired,
         ));
-        assert!(payroll_client.is_payroll_state_transition_allowed(
+        assert!(payroll_client.is_state_transition_allowed(
             &PayrollRunState::ReconciliationRequired,
             &PayrollRunState::Completed,
         ));
@@ -2704,19 +2703,19 @@ mod tests {
         let (payroll_client, _admin, _treasury, _treasury_owner, _employee) =
             setup_simple_payroll(&env);
 
-        assert!(!payroll_client.is_payroll_state_transition_allowed(
+        assert!(!payroll_client.is_state_transition_allowed(
             &PayrollRunState::Draft,
             &PayrollRunState::Completed,
         ));
-        assert!(!payroll_client.is_payroll_state_transition_allowed(
+        assert!(!payroll_client.is_state_transition_allowed(
             &PayrollRunState::Submitted,
             &PayrollRunState::Draft,
         ));
-        assert!(!payroll_client.is_payroll_state_transition_allowed(
+        assert!(!payroll_client.is_state_transition_allowed(
             &PayrollRunState::Completed,
             &PayrollRunState::Failed,
         ));
-        assert!(!payroll_client.is_payroll_state_transition_allowed(
+        assert!(!payroll_client.is_state_transition_allowed(
             &PayrollRunState::Cancelled,
             &PayrollRunState::Submitted,
         ));
