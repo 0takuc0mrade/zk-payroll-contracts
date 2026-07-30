@@ -65,6 +65,8 @@ pub enum PaymentError {
     PeriodAlreadyExists = 6,
     /// The proof has expired and can no longer be used (issue #77).
     ProofExpired = 7,
+    /// Empty payroll batches are rejected to avoid silent no-op execution.
+    EmptyBatch = 8,
 }
 
 /// Contract addresses for dependencies
@@ -464,6 +466,10 @@ impl PaymentExecutor {
             || nullifiers.len() != count
         {
             return Err(PaymentError::ArrayLengthMismatch);
+        }
+
+        if count == 0 {
+            return Err(PaymentError::EmptyBatch);
         }
 
         let mut records = soroban_sdk::Vec::new(&env);
