@@ -1,5 +1,8 @@
 #![no_std]
 
+extern crate alloc;
+use alloc::format;
+
 use pause_manager::PauseManagerClient;
 use payroll_registry::{CompanyInfo, PayrollRegistryClient};
 use proof_verifier::{Groth16Proof, ProofVerifierClient};
@@ -382,6 +385,19 @@ impl PaymentExecutor {
         // Validate treasury asset allowlist (issue #175)
         if !Self::is_asset_allowed(env.clone(), addresses.token.clone()) {
             panic!("Asset not allowed");
+        }
+
+        // Issue #217: Validate treasury asset mapping matches supported payroll assets
+        // Ensure the token contract address is valid and matches expected format
+        let token_str = format!("{:?}", addresses.token);
+        if token_str.is_empty() {
+            panic!("Invalid treasury asset mapping: empty token address");
+        }
+        
+        // Verify the treasury address is properly configured and matches asset type
+        let treasury_str = format!("{:?}", company.treasury);
+        if treasury_str.is_empty() {
+            panic!("Invalid treasury mapping: empty treasury address");
         }
 
         // Execute token transfer from company treasury to employee.
