@@ -1,5 +1,8 @@
 #![no_std]
 
+extern crate alloc;
+use alloc::format;
+
 use pause_manager::PauseManagerClient;
 use payroll_registry::{CompanyInfo, PayrollRegistryClient};
 use proof_verifier::{Groth16Proof, ProofVerifierClient};
@@ -392,7 +395,7 @@ impl PaymentExecutor {
         }
         
         // Verify the treasury address is properly configured and matches asset type
-        let treasury_str = format!("{:?}", addresses.treasury);
+        let treasury_str = format!("{:?}", company.treasury);
         if treasury_str.is_empty() {
             panic!("Invalid treasury mapping: empty treasury address");
         }
