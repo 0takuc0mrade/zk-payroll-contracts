@@ -1296,10 +1296,18 @@ impl Payroll {
             .get(&run_key)
             .expect("Run not found");
 
+        // Issue #244: settlement completion is final. Once a run has reached
+        // `Completed`, reject any further reconciliation update — including a
+        // repeat `Reconciled` call — so settlement cannot be replayed or
+        // finalized more than once for the same payroll run.
+        let current_state = Self::get_payroll_run_state_internal(&e, run_id);
+        if current_state == PayrollRunState::Completed {
+            panic!("Settlement already finalized: run is Completed and cannot be updated again");
+        }
+
         run.reconciliation_status = status.clone();
         e.storage().persistent().set(&run_key, &run);
 
-        let current_state = Self::get_payroll_run_state_internal(&e, run_id);
         let next_state = match status {
             ReconciliationStatus::Reconciled => PayrollRunState::Completed,
             ReconciliationStatus::Unreconciled => PayrollRunState::ReconciliationRequired,
@@ -1877,7 +1885,10 @@ mod tests {
             proofs.push_back(p);
             amounts.push_back(100i128 + i as i128);
             let emp = Address::generate(&env);
-            commitment_client.store_commitment(&emp, &BytesN::from_array(&env, &[0u8; 32]));
+            let mut cmt_bytes = [0u8; 32];
+            cmt_bytes[0] = (i % 256) as u8;
+            cmt_bytes[1] = (i / 256) as u8;
+            commitment_client.store_commitment(&emp, &BytesN::from_array(&env, &cmt_bytes));
             employees.push_back(emp);
         }
 
@@ -2611,6 +2622,50 @@ mod tests {
             &ReconciliationStatus::Failed,
         );
         assert!(result.is_err(), "Completed runs must not be reopened");
+    }
+
+    // ── Issue #244: payroll settlement replay guard ──────────────────────────
+
+    /// A repeat `Reconciled` call for an already-`Completed` run must be
+    /// rejected, not silently re-accepted. Before this guard, calling
+    /// `update_reconciliation_status` twice with the same terminal status
+    /// bypassed the transition check (current == next state) and replayed
+    /// the settlement-completion event.
+    #[test]
+    fn test_reconciled_run_cannot_be_replayed() {
+        let env = Env::default();
+        let (payroll_client, admin, _treasury, _treasury_owner, employee) =
+            setup_simple_payroll(&env);
+
+        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
+        let run_id = payroll_client.batch_process_payroll(
+            &proofs,
+            &amounts,
+            &employees,
+            &1000,
+            &test_nonce(&env, 220),
+            &None,
+        );
+
+        payroll_client.update_reconciliation_status(
+            &admin,
+            &run_id,
+            &ReconciliationStatus::Reconciled,
+        );
+        assert_eq!(
+            payroll_client.get_payroll_run_state(&run_id),
+            PayrollRunState::Completed
+        );
+
+        let result = payroll_client.try_update_reconciliation_status(
+            &admin,
+            &run_id,
+            &ReconciliationStatus::Reconciled,
+        );
+        assert!(
+            result.is_err(),
+            "Settlement completion must not be replayable for a Completed run"
+        );
     }
 
     #[test]
