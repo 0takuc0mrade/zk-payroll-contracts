@@ -866,6 +866,10 @@ impl Payroll {
             panic!("Array length mismatch");
         }
 
+        if count == 0 {
+            panic!("Empty payroll batch");
+        }
+
         assert!(count <= MAX_BATCH, "Batch too large");
 
         // Reject duplicate run nonces before any other work.
@@ -1002,6 +1006,10 @@ impl Payroll {
 
         if amounts.len() != count || employees.len() != count {
             panic!("Array length mismatch");
+        }
+
+        if count == 0 {
+            panic!("Empty payroll batch");
         }
 
         assert!(count <= MAX_BATCH, "Batch too large");
