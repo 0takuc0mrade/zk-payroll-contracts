@@ -79,6 +79,12 @@ pub enum DataKey {
     /// Set by the admin via `lock_commitment_updates` and cleared via
     /// `unlock_commitment_updates`.
     CommitmentLock(Address),
+    /// Marks a commitment value as already bound to an employee, active or
+    /// archived (issue #242). Once set it is never cleared: a commitment
+    /// value that has participated in any active or completed payroll run
+    /// must never be reassigned to a different (or the same) employee, since
+    /// reuse would weaken privacy assumptions and confuse reconciliation.
+    CommitmentIndex(BytesN<32>),
     /// Pause manager address (issue #193).
     PauseManager,
     /// Pending admin rotation proposal (issue #192).
@@ -165,6 +171,9 @@ impl SalaryCommitmentContract {
 
     /// Store a new salary commitment for an employee.
     /// Only the HR admin may call.
+    ///
+    /// The commitment value must be globally unique (issue #242): it cannot
+    /// already be bound to any employee, active or archived.
     pub fn store_commitment(
         env: Env,
         employee: Address,
@@ -172,6 +181,7 @@ impl SalaryCommitmentContract {
     ) -> SalaryCommitment {
         Self::require_not_paused(&env);
         Self::require_admin(&env);
+        Self::register_commitment_uniqueness(&env, &commitment);
 
         let timestamp = env.ledger().timestamp();
 
@@ -219,6 +229,8 @@ impl SalaryCommitmentContract {
             .persistent()
             .get(&key)
             .expect("Commitment not found");
+
+        Self::register_commitment_uniqueness(&env, &new_commitment);
 
         // Archive current commitment before replacing
         Self::archive_commitment(&env, &employee, &existing.commitment, existing.version);
@@ -598,6 +610,16 @@ impl SalaryCommitmentContract {
         }
     }
 
+    /// Reject a commitment value that has already been bound to any
+    /// employee (active or archived) and register it as used (issue #242).
+    fn register_commitment_uniqueness(env: &Env, commitment: &BytesN<32>) {
+        let key = DataKey::CommitmentIndex(commitment.clone());
+        if env.storage().persistent().has(&key) {
+            panic!("Commitment already in use: commitments must be unique across employees and payroll runs");
+        }
+        env.storage().persistent().set(&key, &true);
+    }
+
     fn archive_commitment(env: &Env, employee: &Address, commitment: &BytesN<32>, version: u32) {
         let mut idx: u32 = 0;
         loop {
@@ -673,6 +695,67 @@ mod tests {
 
         assert_eq!(result.commitment, updated);
         assert_eq!(result.version, 2);
+    }
+
+    // ── Issue #242: payroll commitment uniqueness enforcement ────────────────
+
+    /// The same commitment value must not be assignable to two different
+    /// employees — reuse would weaken privacy assumptions (two employees
+    /// appearing to share the same salary + blinding factor) and confuse
+    /// reconciliation.
+    #[test]
+    #[should_panic(expected = "Commitment already in use")]
+    fn test_duplicate_commitment_rejected_for_different_employee() {
+        let (env, contract_id, _admin) = setup_with_admin();
+        let client = SalaryCommitmentContractClient::new(&env, &contract_id);
+
+        let employee_a = Address::generate(&env);
+        let employee_b = Address::generate(&env);
+        let commitment = BytesN::from_array(&env, &[7u8; 32]);
+
+        client.store_commitment(&employee_a, &commitment);
+        client.store_commitment(&employee_b, &commitment);
+    }
+
+    /// Rotating or updating a commitment to a value already bound to another
+    /// employee must be rejected the same way as `store_commitment`.
+    #[test]
+    #[should_panic(expected = "Commitment already in use")]
+    fn test_update_commitment_rejects_value_already_used_elsewhere() {
+        let (env, contract_id, _admin) = setup_with_admin();
+        let client = SalaryCommitmentContractClient::new(&env, &contract_id);
+
+        let employee_a = Address::generate(&env);
+        let employee_b = Address::generate(&env);
+        let commitment_a = BytesN::from_array(&env, &[8u8; 32]);
+        let commitment_b = BytesN::from_array(&env, &[9u8; 32]);
+
+        client.store_commitment(&employee_a, &commitment_a);
+        client.store_commitment(&employee_b, &commitment_b);
+
+        // Attempt to rotate employee B onto employee A's active commitment.
+        client.update_commitment(&employee_b, &commitment_a);
+    }
+
+    /// A commitment value that was rotated out (archived) can never be
+    /// reused, even by a brand-new employee — it must remain retired for
+    /// the lifetime of the contract (issue #242).
+    #[test]
+    #[should_panic(expected = "Commitment already in use")]
+    fn test_archived_commitment_cannot_be_reused() {
+        let (env, contract_id, _admin) = setup_with_admin();
+        let client = SalaryCommitmentContractClient::new(&env, &contract_id);
+
+        let employee = Address::generate(&env);
+        let new_employee = Address::generate(&env);
+        let old_commitment = BytesN::from_array(&env, &[10u8; 32]);
+        let new_commitment = BytesN::from_array(&env, &[11u8; 32]);
+
+        client.store_commitment(&employee, &old_commitment);
+        client.rotate_commitment(&employee, &new_commitment);
+
+        // old_commitment is now archived/revoked but must remain retired.
+        client.store_commitment(&new_employee, &old_commitment);
     }
 
     #[test]
@@ -959,14 +1042,15 @@ mod tests {
         let existing_emp = Address::generate(&env);
         let new_emp = Address::generate(&env);
         let cmt = BytesN::from_array(&env, &[15u8; 32]);
+        let other_cmt = BytesN::from_array(&env, &[16u8; 32]);
 
         client.store_commitment(&existing_emp, &cmt);
         client.lock_commitment_updates(&existing_emp);
 
-        // A new employee should still be able to get a commitment stored
-        let result = client.store_commitment(&new_emp, &cmt);
+        // A new employee should still be able to get a (distinct) commitment stored
+        let result = client.store_commitment(&new_emp, &other_cmt);
         assert_eq!(result.version, 1);
-        assert_eq!(result.commitment, cmt);
+        assert_eq!(result.commitment, other_cmt);
     }
 
     /// A stranger who is neither the admin nor the delegated operator must

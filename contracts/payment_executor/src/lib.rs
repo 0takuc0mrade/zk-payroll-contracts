@@ -66,6 +66,8 @@ pub enum PaymentError {
     PeriodAlreadyExists = 6,
     /// The proof has expired and can no longer be used (issue #77).
     ProofExpired = 7,
+    /// Empty payroll batches are rejected to avoid silent no-op execution.
+    EmptyBatch = 8,
 }
 
 /// Contract addresses for dependencies
@@ -469,6 +471,10 @@ impl PaymentExecutor {
             || nullifiers.len() != count
         {
             return Err(PaymentError::ArrayLengthMismatch);
+        }
+
+        if count == 0 {
+            return Err(PaymentError::EmptyBatch);
         }
 
         let mut records = soroban_sdk::Vec::new(&env);
@@ -1369,6 +1375,120 @@ mod tests {
         let set_event = env.events().all().get(after_set - 1).unwrap();
         let set_sym0: Symbol = set_event.1.get(0).unwrap().try_into_val(&env.clone()).unwrap();
         assert_eq!(set_sym0, Symbol::new(&env, "TreasuryAssetAllowedUpdated"));
+    }
+
+    // ── Issue #245: operator vs admin role separation ─────────────────────────
+    //
+    // `payment_executor` has two distinct privileged roles that must not be
+    // conflated: the protocol-level `ExecutorAdmin` (gates contract-wide
+    // config: `set_asset_allowed`, `set_pause_manager`) and each company's
+    // own `admin` (gates that company's periods and payments only — the
+    // "operator" of its own payroll). Neither role should be able to
+    // exercise the other's capabilities.
+
+    /// A company admin (this company's payroll "operator") must not be able
+    /// to exercise the protocol-level `ExecutorAdmin` capability of changing
+    /// the treasury asset allowlist just because they administer a company.
+    #[test]
+    #[should_panic(expected = "authorized")]
+    fn test_company_admin_cannot_set_asset_allowed() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, PaymentExecutor);
+        let client = PaymentExecutorClient::new(&env, &contract_id);
+
+        let addresses = setup_addresses(&env);
+        client.initialize(&addresses);
+
+        let executor_admin = Address::generate(&env);
+        client.set_executor_admin(&executor_admin);
+
+        let registry_client = PayrollRegistryClient::new(&env, &addresses.registry);
+        let company_admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let _company_id = registry_client.register_company(&company_admin, &treasury);
+
+        // Company admin (not the executor admin) attempts a protocol-level
+        // config change.
+        env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &company_admin,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "set_asset_allowed",
+                args: (addresses.token.clone(), false).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.set_asset_allowed(&addresses.token, &false);
+    }
+
+    /// The protocol-level `ExecutorAdmin` must not be able to trigger payroll
+    /// execution for a company it does not administer — that capability
+    /// belongs solely to the company's own admin.
+    #[test]
+    #[should_panic(expected = "authorized")]
+    fn test_executor_admin_cannot_execute_payment_for_foreign_company() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, PaymentExecutor);
+        let client = PaymentExecutorClient::new(&env, &contract_id);
+
+        let addresses = setup_addresses(&env);
+        client.initialize(&addresses);
+
+        let executor_admin = Address::generate(&env);
+        client.set_executor_admin(&executor_admin);
+
+        let registry_client = PayrollRegistryClient::new(&env, &addresses.registry);
+        let commitment_client = SalaryCommitmentContractClient::new(&env, &addresses.commitment);
+        let token_client = TokenClient::new(&env, &addresses.token);
+
+        let company_admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let company_id = registry_client.register_company(&company_admin, &treasury);
+
+        let employee = Address::generate(&env);
+        let commitment = BytesN::from_array(&env, &[5u8; 32]);
+        commitment_client.store_commitment(&employee, &commitment);
+        registry_client.add_employee(&company_id, &employee, &commitment);
+        token_client.mint(&treasury, &100_000i128);
+
+        client.create_period(&company_id);
+
+        let proof_a = BytesN::from_array(&env, &[1u8; 64]);
+        let proof_b = BytesN::from_array(&env, &[2u8; 128]);
+        let proof_c = BytesN::from_array(&env, &[3u8; 64]);
+        let nullifier = BytesN::from_array(&env, &[4u8; 32]);
+
+        // Executor admin (not this company's admin) attempts to execute a
+        // payment for a company it does not administer.
+        env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &executor_admin,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "execute_payment",
+                args: (
+                    company_id,
+                    employee.clone(),
+                    1000i128,
+                    proof_a.clone(),
+                    proof_b.clone(),
+                    proof_c.clone(),
+                    nullifier.clone(),
+                    1u32,
+                )
+                    .into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        let _ = client.execute_payment(
+            &company_id,
+            &employee,
+            &1000i128,
+            &proof_a,
+            &proof_b,
+            &proof_c,
+            &nullifier,
+            &1u32,
+        );
     }
 }
 

@@ -861,6 +861,10 @@ impl Payroll {
             panic!("Array length mismatch");
         }
 
+        if count == 0 {
+            panic!("Empty payroll batch");
+        }
+
         assert!(count <= MAX_BATCH, "Batch too large");
 
         // Reject duplicate run nonces before any other work.
@@ -933,11 +937,13 @@ impl Payroll {
         e.storage().persistent().get(&DataKey::PendingRun(run_id))
     }
 
-    /// Cancel a pending payroll run without executing any payments.
+    /// Finalize a pending payroll run, executing payments and creating a
+    /// permanent `PayrollRun` record (issue #198).
     ///
-    /// Only the admin may cancel. The cancellation frees the nonce for reuse
-    /// (actually, the nonce is marked as consumed, so it cannot be reused).
-    /// No funds are transferred; this is a pure cleanup operation.
+    /// Only the admin may finalize. The caller must supply the same proofs,
+    /// amounts, and employees that were validated during `prepare_payroll_run`.
+    /// The pending run must exist and its metadata (total_amount, employee_count)
+    /// must match the supplied batch.
     ///
     /// Cancellation emits an event for audit trails. Finalized runs cannot be
     /// cancelled retroactively.
@@ -974,8 +980,82 @@ impl Payroll {
         e.storage().persistent().remove(&pending_key);
         Self::record_payroll_run_state(&e, run_id, PayrollRunState::Cancelled);
 
-        // Emit cancellation event
-        payroll_events::emit_run_cancelled(&e, run_id, pending_run.total_amount);
+        let run = PayrollRun {
+            run_id,
+            executed_at: e.ledger().timestamp(),
+            admin: addrs.admin.clone(),
+            total_amount: pending_run.total_amount,
+            employee_count: pending_run.employee_count,
+            draft_hash: pending_run.draft_hash.clone(),
+            nonce: pending_run.nonce.clone(),
+            reconciliation_status: ReconciliationStatus::Unreconciled,
+            metadata_hash: BytesN::from_array(&e, &[0u8; 32]),
+        };
+        e.storage()
+            .persistent()
+            .set(&DataKey::PayrollRun(run_id), &run);
+
+        e.events().publish(
+            (
+                symbol_short!("payroll"),
+                Symbol::new(&e, "run_finalized"),
+            ),
+            (run_id, pending_run.total_amount),
+        );
+    }
+
+    /// Cancel a pending payroll run without executing any payments (issue #198).
+    ///
+    /// Only the admin may cancel. The `reason` is recorded in the event for
+    /// audit trails. No funds are transferred; this is a pure cleanup operation.
+    ///
+    /// Finalized runs cannot be cancelled retroactively. The run nonce remains
+    /// permanently spent after cancellation (one-time-use for audit integrity).
+    ///
+    /// This function serves as a high-priority escape hatch: it deliberately
+    /// does NOT require the system to be unpaused. An admin who can pause the
+    /// system can also cancel a pending run while paused, enabling rapid
+    /// intervention when a run is discovered to be unsafe.
+    pub fn cancel_payroll_run(e: Env, admin: Address, run_id: u64, reason: Symbol) {
+        let addrs: ContractAddresses = e
+            .storage()
+            .persistent()
+            .get(&DataKey::Addresses)
+            .expect("Not initialized");
+        if admin != addrs.admin {
+            panic!("Unauthorized");
+        }
+        admin.require_auth();
+
+        let pending_key = DataKey::PendingRun(run_id);
+
+        // Guard: reject cancellation if a finalized PayrollRun already exists
+        // for this run_id (completed via finalize_payroll_run or
+        // batch_process_payroll).
+        if e.storage()
+            .persistent()
+            .has(&DataKey::PayrollRun(run_id))
+        {
+            panic!("Cannot cancel a finalized payroll run");
+        }
+
+        let pending_run: PendingPayrollRun = e
+            .storage()
+            .persistent()
+            .get(&pending_key)
+            .expect("Pending run not found");
+
+        // Remove the pending run from storage
+        e.storage().persistent().remove(&pending_key);
+
+        // Emit cancellation event with reason for audit trail
+        e.events().publish(
+            (
+                symbol_short!("payroll"),
+                Symbol::new(&e, "run_cancelled"),
+            ),
+            (run_id, pending_run.total_amount, reason),
+        );
     }
 
     pub fn batch_process_payroll(
@@ -991,6 +1071,10 @@ impl Payroll {
 
         if amounts.len() != count || employees.len() != count {
             panic!("Array length mismatch");
+        }
+
+        if count == 0 {
+            panic!("Empty payroll batch");
         }
 
         assert!(count <= MAX_BATCH, "Batch too large");
@@ -1263,10 +1347,18 @@ impl Payroll {
             .get(&run_key)
             .expect("Run not found");
 
+        // Issue #244: settlement completion is final. Once a run has reached
+        // `Completed`, reject any further reconciliation update — including a
+        // repeat `Reconciled` call — so settlement cannot be replayed or
+        // finalized more than once for the same payroll run.
+        let current_state = Self::get_payroll_run_state_internal(&e, run_id);
+        if current_state == PayrollRunState::Completed {
+            panic!("Settlement already finalized: run is Completed and cannot be updated again");
+        }
+
         run.reconciliation_status = status.clone();
         e.storage().persistent().set(&run_key, &run);
 
-        let current_state = Self::get_payroll_run_state_internal(&e, run_id);
         let next_state = match status {
             ReconciliationStatus::Reconciled => PayrollRunState::Completed,
             ReconciliationStatus::Unreconciled => PayrollRunState::ReconciliationRequired,
@@ -1816,7 +1908,10 @@ mod tests {
             proofs.push_back(p);
             amounts.push_back(100i128 + i as i128);
             let emp = Address::generate(&env);
-            commitment_client.store_commitment(&emp, &BytesN::from_array(&env, &[0u8; 32]));
+            let mut cmt_bytes = [0u8; 32];
+            cmt_bytes[0] = (i % 256) as u8;
+            cmt_bytes[1] = (i / 256) as u8;
+            commitment_client.store_commitment(&emp, &BytesN::from_array(&env, &cmt_bytes));
             employees.push_back(emp);
         }
 
@@ -2552,6 +2647,50 @@ mod tests {
         assert!(result.is_err(), "Completed runs must not be reopened");
     }
 
+    // ── Issue #244: payroll settlement replay guard ──────────────────────────
+
+    /// A repeat `Reconciled` call for an already-`Completed` run must be
+    /// rejected, not silently re-accepted. Before this guard, calling
+    /// `update_reconciliation_status` twice with the same terminal status
+    /// bypassed the transition check (current == next state) and replayed
+    /// the settlement-completion event.
+    #[test]
+    fn test_reconciled_run_cannot_be_replayed() {
+        let env = Env::default();
+        let (payroll_client, admin, _treasury, _treasury_owner, employee) =
+            setup_simple_payroll(&env);
+
+        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
+        let run_id = payroll_client.batch_process_payroll(
+            &proofs,
+            &amounts,
+            &employees,
+            &1000,
+            &test_nonce(&env, 220),
+            &None,
+        );
+
+        payroll_client.update_reconciliation_status(
+            &admin,
+            &run_id,
+            &ReconciliationStatus::Reconciled,
+        );
+        assert_eq!(
+            payroll_client.get_payroll_run_state(&run_id),
+            PayrollRunState::Completed
+        );
+
+        let result = payroll_client.try_update_reconciliation_status(
+            &admin,
+            &run_id,
+            &ReconciliationStatus::Reconciled,
+        );
+        assert!(
+            result.is_err(),
+            "Settlement completion must not be replayable for a Completed run"
+        );
+    }
+
     #[test]
     fn test_failed_reconciliation_writes_retryable_payroll_state() {
         let env = Env::default();
@@ -2840,7 +2979,8 @@ mod tests {
         );
 
         let non_admin = Address::generate(&env);
-        payroll_client.cancel_payroll_run(&non_admin, &run_id);
+        let reason = Symbol::new(&env, "attack");
+        payroll_client.cancel_payroll_run(&non_admin, &run_id, &reason);
     }
 
     #[test]
@@ -2850,7 +2990,8 @@ mod tests {
         let (payroll_client, admin, _treasury, _treasury_owner, _employee) =
             setup_simple_payroll(&env);
 
-        payroll_client.cancel_payroll_run(&admin, &999u64);
+        let reason = Symbol::new(&env, "no_such_run");
+        payroll_client.cancel_payroll_run(&admin, &999u64, &reason);
     }
 
     // ── Issue #177: payroll run metadata hash checks ──────────────────────────
@@ -2979,8 +3120,9 @@ mod tests {
             &None,
         );
 
-        payroll_client.cancel_payroll_run(&admin, &run_id);
-        payroll_client.cancel_payroll_run(&admin, &run_id);
+        let reason = Symbol::new(&env, "double_cancel");
+        payroll_client.cancel_payroll_run(&admin, &run_id, &reason);
+        payroll_client.cancel_payroll_run(&admin, &run_id, &reason);
     }
 
     #[test]
@@ -2995,7 +3137,8 @@ mod tests {
             payroll_client.prepare_payroll_run(&proofs, &amounts, &employees, &1000, &nonce, &None);
 
         assert!(payroll_client.get_pending_run(&run_id).is_some());
-        payroll_client.cancel_payroll_run(&admin, &run_id);
+        let reason = Symbol::new(&env, "test_cleanup");
+        payroll_client.cancel_payroll_run(&admin, &run_id, &reason);
 
         assert!(payroll_client.get_pending_run(&run_id).is_none());
     }
@@ -3267,7 +3410,8 @@ mod tests {
 
         // Failed cancel (wrong caller) should not affect the pending run
         let attacker = Address::generate(&env);
-        let cancel_result = payroll_client.try_cancel_payroll_run(&attacker, &run_id);
+        let reason = Symbol::new(&env, "attack");
+        let cancel_result = payroll_client.try_cancel_payroll_run(&attacker, &run_id, &reason);
         assert!(cancel_result.is_err());
 
         // Pending run should still exist
@@ -3552,9 +3696,10 @@ mod tests {
             &None,
         );
 
-        payroll_client.cancel_payroll_run(&admin, &run_id);
+        let reason = Symbol::new(&env, "settlement_guard");
+        payroll_client.cancel_payroll_run(&admin, &run_id, &reason);
 
-        let result = payroll_client.try_cancel_payroll_run(&admin, &run_id);
+        let result = payroll_client.try_cancel_payroll_run(&admin, &run_id, &reason);
         assert!(result.is_err());
     }
 
