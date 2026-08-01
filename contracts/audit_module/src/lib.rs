@@ -1,6 +1,7 @@
 #![no_std]
 
 use pause_manager::PauseManagerClient;
+use payroll_events;
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, xdr::ToXdr, Address, Bytes, BytesN, Env,
     Symbol, Vec,
@@ -161,6 +162,8 @@ impl AuditModule {
         env.storage()
             .persistent()
             .set(&DataKey::PauseManager, &pause_manager);
+
+        payroll_events::emit_audit_pause_manager_set(&env, pause_manager);
     }
 
     // -----------------------------------------------------------------------
@@ -183,12 +186,7 @@ impl AuditModule {
             .persistent()
             .set(&DataKey::AuditorKey(auditor.clone()), &record);
 
-        env.events().publish(
-            (Symbol::new(&env, "ViewKeyGenerated"), auditor),
-            (key_bytes.clone(), expiration_ledger),
-        );
-        // topics : ("ViewKeyGenerated", auditor)
-        // data   : (key_bytes, expiration_ledger)
+        payroll_events::emit_view_key_generated(&env, auditor, expiration_ledger);
 
         key_bytes
     }
@@ -222,17 +220,7 @@ impl AuditModule {
             .persistent()
             .remove(&DataKey::AuditorKey(auditor.clone()));
 
-        // Emit revocation event for audit trail
-        env.events().publish(
-            (
-                Symbol::new(&env, "AuditAccessRevoked"),
-                admin,
-                auditor.clone(),
-            ),
-            (env.ledger().timestamp(),),
-        );
-        // topics : ("AuditAccessRevoked", admin, auditor)
-        // data   : (timestamp,)
+        payroll_events::emit_audit_access_revoked(&env, admin, auditor);
 
         Ok(())
     }
@@ -437,12 +425,13 @@ impl AuditModule {
         let matched = keyed_computed == keyed_stored;
 
         if matched {
-            env.events().publish(
-                (Symbol::new(env, "AuditSuccessful"), auditor.clone()),
-                (scope, keyed_stored),
-            );
-            // topics : ("AuditSuccessful", auditor)
-            // data   : (scope, keyed_stored)
+            let scope_sym = match scope {
+                AuditScope::FullCompany => Symbol::new(&env, "FullCompany"),
+                AuditScope::TimeRange => Symbol::new(&env, "TimeRange"),
+                AuditScope::EmployeeList => Symbol::new(&env, "EmployeeList"),
+                AuditScope::AggregateOnly => Symbol::new(&env, "AggregateOnly"),
+            };
+            payroll_events::emit_audit_successful(&env, auditor.clone(), scope_sym);
         }
 
         matched
@@ -466,19 +455,13 @@ impl AuditModule {
             verified: true,
         };
 
-        env.events().publish(
-            (
-                Symbol::new(&env, "AggregateAuditGenerated"),
-                auditor.clone(),
-            ),
-            (
-                report.company_id.clone(),
-                report.period_start,
-                report.period_end,
-            ),
+        payroll_events::emit_aggregate_audit_generated(
+            &env,
+            auditor.clone(),
+            report.company_id.clone(),
+            report.period_start,
+            report.period_end,
         );
-        // topics : ("AggregateAuditGenerated", auditor)
-        // data   : (company_id, period_start, period_end)
 
         // Record the aggregate report generation as an audit log entry.
         Self::record_audit_log(&env, &auditor, AuditScope::AggregateOnly, true);
@@ -608,9 +591,13 @@ impl AuditModule {
             exported_by: auditor.clone(),
         };
 
-        env.events().publish(
-            (Symbol::new(&env, "AuditSummaryExported"), auditor),
-            (company_id, period_start, period_end, total),
+        payroll_events::emit_audit_summary_exported(
+            &env,
+            auditor,
+            company_id,
+            period_start,
+            period_end,
+            total,
         );
 
         Ok(summary)
