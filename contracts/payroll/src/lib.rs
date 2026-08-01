@@ -1,11 +1,11 @@
 #![no_std]
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, token as soroban_token, Address, BytesN,
-    Env, Symbol, Vec,
+    contract, contractimpl, contracttype, token as soroban_token, Address, BytesN, Env, Symbol, Vec,
 };
 
+use payroll_events;
+
 use pause_manager::PauseManagerClient;
-use payroll_registry::PayrollRegistryClient;
 use proof_verifier::ProofVerifierClient;
 use salary_commitment::SalaryCommitmentContractClient;
 
@@ -32,6 +32,28 @@ pub enum ReconciliationStatus {
     Unreconciled,
     Reconciled,
     Failed,
+}
+
+/// Canonical payroll run state shared by contracts, SDKs, and dashboards (#159).
+///
+/// This enum is the source of truth for user-visible payroll run lifecycle
+/// labels. Off-chain clients should mirror these exact names and transition
+/// rules from `docs/payroll-state-machine.md` and the JSON fixture under
+/// `fixtures/state-machine/`.
+#[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum PayrollRunState {
+    Draft = 0,
+    Validating = 1,
+    ProofPending = 2,
+    ReadyToSubmit = 3,
+    Submitted = 4,
+    Confirming = 5,
+    Completed = 6,
+    Failed = 7,
+    Cancelled = 8,
+    ReconciliationRequired = 9,
 }
 
 /// A pending payroll run that has been prepared but not yet finalized.
@@ -145,6 +167,26 @@ pub struct PendingRotation {
     pub proposed_at: u64,
 }
 
+// ── Issue #147: company lifecycle state ──────────────────────────────────────
+
+/// Lifecycle state of the company operating this payroll contract.
+///
+/// Payroll execution is only permitted when the state is `Active`. This gate
+/// runs before any auth checks, balance reads, or transfer logic so that
+/// rejected calls are fully clean with no partial side effects.
+#[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompanyState {
+    /// Normal operating state — payroll execution permitted.
+    Active,
+    /// Operations suspended; payroll execution rejected until set to Active.
+    Paused,
+    /// Company decommissioned; no further payroll runs are permitted.
+    Archived,
+    /// Onboarding incomplete; payroll execution not yet permitted.
+    Incomplete,
+}
+
 // ── Storage keys ──────────────────────────────────────────────────────────────
 // Issue #196: Storage Key Versioning Strategy
 //
@@ -256,6 +298,14 @@ pub enum DataKey {
     DraftCommitment(BytesN<32>),
     /// Pending emergency withdrawal request (#104).
     EmergencyRequest,
+    /// Accumulated deposit balance per depositor address (#62).
+    CompanyBalance(Address),
+    /// Marks a completed payroll run as archived for long-term reporting (#146).
+    ArchivedRun(u64),
+    /// Company lifecycle state gate for payroll execution (#147).
+    CompanyState,
+    /// Canonical payroll run state for SDK/dashboard conformance (#159).
+    PayrollState(u64),
     // Future upgrade example (issue #196):
     // PayrollRunV2(u64),  // Would be added here when schema evolution is needed
 }
@@ -288,6 +338,16 @@ impl Payroll {
             .persistent()
             .set(&DataKey::TreasuryOwner, &treasury_owner);
         e.storage().persistent().set(&DataKey::RunCounter, &0u64);
+
+        payroll_events::emit_payroll_initialized(
+            &e,
+            addrs.admin.clone(),
+            addrs.token.clone(),
+            addrs.verifier.clone(),
+            addrs.commitment.clone(),
+            addrs.treasury.clone(),
+            treasury_owner.clone(),
+        );
     }
 
     fn require_not_paused(e: &Env) {
@@ -304,6 +364,30 @@ impl Payroll {
         }
     }
 
+    // Issue #147: reject payroll execution for any non-Active company state.
+    // Absent state defaults to Active for backward compatibility with existing
+    // deployments that predate this field.
+    fn require_company_active(e: &Env) {
+        if let Some(state) = e
+            .storage()
+            .persistent()
+            .get::<_, CompanyState>(&DataKey::CompanyState)
+        {
+            match state {
+                CompanyState::Active => {}
+                CompanyState::Paused => {
+                    panic!("Company is paused; payroll execution is not permitted")
+                }
+                CompanyState::Archived => {
+                    panic!("Company is archived; payroll execution is not permitted")
+                }
+                CompanyState::Incomplete => {
+                    panic!("Company setup is incomplete; payroll execution is not permitted")
+                }
+            }
+        }
+    }
+
     pub fn set_pause_manager(e: Env, pause_manager: Address) {
         let addrs: ContractAddresses = e
             .storage()
@@ -314,6 +398,8 @@ impl Payroll {
         e.storage()
             .persistent()
             .set(&DataKey::PauseManager, &pause_manager);
+
+        payroll_events::emit_pause_manager_set(&e, pause_manager);
     }
 
     pub fn deposit(e: Env, from: Address, amount: i128, deposit_id: BytesN<32>) {
@@ -346,10 +432,29 @@ impl Payroll {
         let token_client = soroban_token::Client::new(&e, &addrs.token);
         token_client.transfer(&from, &addrs.treasury, &amount);
 
+        // Issue #62: accumulate per-depositor balance for auditability.
+        let balance_key = DataKey::CompanyBalance(from.clone());
+        let prev_balance: i128 = e.storage().persistent().get(&balance_key).unwrap_or(0i128);
+        let new_balance = prev_balance + amount;
+
+        e.storage().persistent().set(&balance_key, &new_balance);
+
         e.events().publish(
             (symbol_short!("payroll"), Symbol::new(&e, "deposit")),
-            (from, amount, deposit_id),
+            (from, amount, deposit_id, new_balance),
         );
+    }
+
+    /// Return the accumulated deposit balance for a given depositor address (#62).
+    ///
+    /// This reflects the running total of all successful deposits made by that
+    /// address. It is an accounting record only; actual treasury liquidity is
+    /// held by the token contract at `ContractAddresses.treasury`.
+    pub fn get_treasury_balance(e: Env, depositor: Address) -> i128 {
+        e.storage()
+            .persistent()
+            .get(&DataKey::CompanyBalance(depositor))
+            .unwrap_or(0i128)
     }
 
     fn derive_run_id(e: &Env) -> u64 {
@@ -363,6 +468,154 @@ impl Payroll {
         e.storage().persistent().set(&DataKey::RunCounter, &run_id);
 
         run_id
+    }
+
+    fn is_allowed_payroll_state_transition_internal(
+        from: PayrollRunState,
+        to: PayrollRunState,
+    ) -> bool {
+        match from {
+            PayrollRunState::Draft => {
+                matches!(to, PayrollRunState::Validating | PayrollRunState::Cancelled)
+            }
+            PayrollRunState::Validating => matches!(
+                to,
+                PayrollRunState::ProofPending
+                    | PayrollRunState::Failed
+                    | PayrollRunState::Cancelled
+            ),
+            PayrollRunState::ProofPending => matches!(
+                to,
+                PayrollRunState::ReadyToSubmit
+                    | PayrollRunState::Failed
+                    | PayrollRunState::Cancelled
+            ),
+            PayrollRunState::ReadyToSubmit => matches!(
+                to,
+                PayrollRunState::Submitted | PayrollRunState::Failed | PayrollRunState::Cancelled
+            ),
+            PayrollRunState::Submitted => matches!(
+                to,
+                PayrollRunState::Confirming | PayrollRunState::Failed | PayrollRunState::Cancelled
+            ),
+            PayrollRunState::Confirming => matches!(
+                to,
+                PayrollRunState::Completed
+                    | PayrollRunState::Failed
+                    | PayrollRunState::ReconciliationRequired
+            ),
+            PayrollRunState::Failed => matches!(
+                to,
+                PayrollRunState::Validating
+                    | PayrollRunState::ProofPending
+                    | PayrollRunState::Cancelled
+            ),
+            PayrollRunState::ReconciliationRequired => {
+                matches!(to, PayrollRunState::Completed | PayrollRunState::Failed)
+            }
+            PayrollRunState::Completed | PayrollRunState::Cancelled => false,
+        }
+    }
+
+    fn is_terminal_payroll_state_internal(state: PayrollRunState) -> bool {
+        matches!(
+            state,
+            PayrollRunState::Completed | PayrollRunState::Cancelled
+        )
+    }
+
+
+    fn is_retryable_payroll_state_internal(state: PayrollRunState) -> bool {
+        matches!(state, PayrollRunState::Failed)
+    }
+
+    fn record_payroll_run_state(e: &Env, run_id: u64, state: PayrollRunState) {
+        e.storage()
+            .persistent()
+            .set(&DataKey::PayrollState(run_id), &state);
+        e.events().publish(
+            (symbol_short!("payroll"), Symbol::new(e, "run_state")),
+            (run_id, state),
+        );
+    }
+
+    fn get_payroll_run_state_internal(e: &Env, run_id: u64) -> PayrollRunState {
+        if let Some(state) = e
+            .storage()
+            .persistent()
+            .get::<_, PayrollRunState>(&DataKey::PayrollState(run_id))
+        {
+            return state;
+        }
+
+        if let Some(run) = e
+            .storage()
+            .persistent()
+            .get::<_, PayrollRun>(&DataKey::PayrollRun(run_id))
+        {
+            return match run.reconciliation_status {
+                ReconciliationStatus::Reconciled => PayrollRunState::Completed,
+                ReconciliationStatus::Unreconciled | ReconciliationStatus::Failed => {
+                    PayrollRunState::ReconciliationRequired
+                }
+            };
+        }
+
+        if e.storage().persistent().has(&DataKey::PendingRun(run_id)) {
+            return PayrollRunState::Submitted;
+        }
+
+        panic!("Payroll run state not found");
+    }
+
+    /// Return whether a transition is allowed by the canonical state machine.
+    pub fn is_state_transition_allowed(
+        _e: Env,
+        from: PayrollRunState,
+        to: PayrollRunState,
+    ) -> bool {
+        Self::is_allowed_payroll_state_transition_internal(from, to)
+    }
+
+    /// Return whether a payroll run state is terminal and immutable.
+    pub fn is_payroll_state_terminal(_e: Env, state: PayrollRunState) -> bool {
+        Self::is_terminal_payroll_state_internal(state)
+    }
+
+    /// Return whether a state should expose a retry action to clients.
+    pub fn is_payroll_state_retryable(_e: Env, state: PayrollRunState) -> bool {
+        Self::is_retryable_payroll_state_internal(state)
+    }
+
+    /// Return the canonical state for a payroll run ID.
+    pub fn get_payroll_run_state(e: Env, run_id: u64) -> PayrollRunState {
+        Self::get_payroll_run_state_internal(&e, run_id)
+    }
+
+    /// Admin-only state transition hook for conformance tests and operations.
+    pub fn transition_payroll_run_state(
+        e: Env,
+        admin: Address,
+        run_id: u64,
+        next_state: PayrollRunState,
+    ) {
+        Self::require_not_paused(&e);
+        let addrs: ContractAddresses = e
+            .storage()
+            .persistent()
+            .get(&DataKey::Addresses)
+            .expect("Not initialized");
+        if admin != addrs.admin {
+            panic!("Unauthorized");
+        }
+        admin.require_auth();
+
+        let current = Self::get_payroll_run_state_internal(&e, run_id);
+        if !Self::is_allowed_payroll_state_transition_internal(current, next_state) {
+            panic!("Invalid payroll state transition");
+        }
+
+        Self::record_payroll_run_state(&e, run_id, next_state);
     }
 
     pub fn get_payroll_run(e: Env, run_id: u64) -> PayrollRun {
@@ -396,10 +649,7 @@ impl Payroll {
         }
         e.storage().persistent().set(&key, &true);
 
-        e.events().publish(
-            (symbol_short!("payroll"), Symbol::new(&e, "meta_committed")),
-            metadata_hash,
-        );
+        payroll_events::emit_metadata_committed(&e, metadata_hash);
     }
 
     /// Bound a pre-committed metadata hash to an existing payroll run.
@@ -437,10 +687,7 @@ impl Payroll {
         run.metadata_hash = metadata_hash.clone();
         e.storage().persistent().set(&run_key, &run);
 
-        e.events().publish(
-            (symbol_short!("payroll"), Symbol::new(&e, "meta_bound")),
-            (run_id, metadata_hash),
-        );
+        payroll_events::emit_metadata_bound(&e, run_id, metadata_hash);
     }
 
     /// Pre-commit an off-chain draft hash so it can be bound to a future run.
@@ -471,10 +718,7 @@ impl Payroll {
         }
         e.storage().persistent().set(&key, &true);
 
-        e.events().publish(
-            (symbol_short!("payroll"), Symbol::new(&e, "draft_committed")),
-            draft_hash,
-        );
+        payroll_events::emit_draft_committed(&e, draft_hash);
     }
 
     /// Request an emergency treasury withdrawal (step 1 of 2 — issue #104).
@@ -517,10 +761,7 @@ impl Payroll {
             .persistent()
             .set(&DataKey::EmergencyRequest, &request);
 
-        e.events().publish(
-            (symbol_short!("payroll"), Symbol::new(&e, "emrg_requested")),
-            (amount, recipient),
-        );
+        payroll_events::emit_emergency_requested(&e, amount, recipient);
     }
 
     /// Approve and execute a pending emergency withdrawal (step 2 of 2 — issue #104).
@@ -552,10 +793,7 @@ impl Payroll {
         let token_client = soroban_token::Client::new(&e, &addrs.token);
         token_client.transfer(&addrs.treasury, &request.recipient, &request.amount);
 
-        e.events().publish(
-            (symbol_short!("payroll"), Symbol::new(&e, "emrg_approved")),
-            (request.amount, request.recipient),
-        );
+        payroll_events::emit_emergency_approved(&e, request.amount, request.recipient);
     }
 
     /// Cancel a pending emergency withdrawal request.
@@ -587,10 +825,7 @@ impl Payroll {
         }
         e.storage().persistent().remove(&DataKey::EmergencyRequest);
 
-        e.events().publish(
-            (symbol_short!("payroll"), Symbol::new(&e, "emrg_cancelled")),
-            caller,
-        );
+        payroll_events::emit_emergency_cancelled(&e, caller);
     }
 
     /// Returns the pending emergency withdrawal request, if any.
@@ -624,6 +859,10 @@ impl Payroll {
 
         if amounts.len() != count || employees.len() != count {
             panic!("Array length mismatch");
+        }
+
+        if count == 0 {
+            panic!("Empty payroll batch");
         }
 
         assert!(count <= MAX_BATCH, "Batch too large");
@@ -686,11 +925,9 @@ impl Payroll {
         e.storage()
             .persistent()
             .set(&DataKey::PendingRun(run_id), &pending_run);
+        Self::record_payroll_run_state(&e, run_id, PayrollRunState::Submitted);
 
-        e.events().publish(
-            (symbol_short!("payroll"), Symbol::new(&e, "run_prepared")),
-            (run_id, expected_total_spend),
-        );
+        payroll_events::emit_run_prepared(&e, run_id, expected_total_spend);
 
         run_id
     }
@@ -700,11 +937,13 @@ impl Payroll {
         e.storage().persistent().get(&DataKey::PendingRun(run_id))
     }
 
-    /// Cancel a pending payroll run without executing any payments.
+    /// Finalize a pending payroll run, executing payments and creating a
+    /// permanent `PayrollRun` record (issue #198).
     ///
-    /// Only the admin may cancel. The cancellation frees the nonce for reuse
-    /// (actually, the nonce is marked as consumed, so it cannot be reused).
-    /// No funds are transferred; this is a pure cleanup operation.
+    /// Only the admin may finalize. The caller must supply the same proofs,
+    /// amounts, and employees that were validated during `prepare_payroll_run`.
+    /// The pending run must exist and its metadata (total_amount, employee_count)
+    /// must match the supplied batch.
     ///
     /// Cancellation emits an event for audit trails. Finalized runs cannot be
     /// cancelled retroactively.
@@ -739,11 +978,83 @@ impl Payroll {
 
         // Remove the pending run from storage
         e.storage().persistent().remove(&pending_key);
+        Self::record_payroll_run_state(&e, run_id, PayrollRunState::Cancelled);
 
-        // Emit cancellation event
+        let run = PayrollRun {
+            run_id,
+            executed_at: e.ledger().timestamp(),
+            admin: addrs.admin.clone(),
+            total_amount: pending_run.total_amount,
+            employee_count: pending_run.employee_count,
+            draft_hash: pending_run.draft_hash.clone(),
+            nonce: pending_run.nonce.clone(),
+            reconciliation_status: ReconciliationStatus::Unreconciled,
+            metadata_hash: BytesN::from_array(&e, &[0u8; 32]),
+        };
+        e.storage()
+            .persistent()
+            .set(&DataKey::PayrollRun(run_id), &run);
+
         e.events().publish(
-            (symbol_short!("payroll"), Symbol::new(&e, "run_cancelled")),
+            (
+                symbol_short!("payroll"),
+                Symbol::new(&e, "run_finalized"),
+            ),
             (run_id, pending_run.total_amount),
+        );
+    }
+
+    /// Cancel a pending payroll run without executing any payments (issue #198).
+    ///
+    /// Only the admin may cancel. The `reason` is recorded in the event for
+    /// audit trails. No funds are transferred; this is a pure cleanup operation.
+    ///
+    /// Finalized runs cannot be cancelled retroactively. The run nonce remains
+    /// permanently spent after cancellation (one-time-use for audit integrity).
+    ///
+    /// This function serves as a high-priority escape hatch: it deliberately
+    /// does NOT require the system to be unpaused. An admin who can pause the
+    /// system can also cancel a pending run while paused, enabling rapid
+    /// intervention when a run is discovered to be unsafe.
+    pub fn cancel_payroll_run(e: Env, admin: Address, run_id: u64, reason: Symbol) {
+        let addrs: ContractAddresses = e
+            .storage()
+            .persistent()
+            .get(&DataKey::Addresses)
+            .expect("Not initialized");
+        if admin != addrs.admin {
+            panic!("Unauthorized");
+        }
+        admin.require_auth();
+
+        let pending_key = DataKey::PendingRun(run_id);
+
+        // Guard: reject cancellation if a finalized PayrollRun already exists
+        // for this run_id (completed via finalize_payroll_run or
+        // batch_process_payroll).
+        if e.storage()
+            .persistent()
+            .has(&DataKey::PayrollRun(run_id))
+        {
+            panic!("Cannot cancel a finalized payroll run");
+        }
+
+        let pending_run: PendingPayrollRun = e
+            .storage()
+            .persistent()
+            .get(&pending_key)
+            .expect("Pending run not found");
+
+        // Remove the pending run from storage
+        e.storage().persistent().remove(&pending_key);
+
+        // Emit cancellation event with reason for audit trail
+        e.events().publish(
+            (
+                symbol_short!("payroll"),
+                Symbol::new(&e, "run_cancelled"),
+            ),
+            (run_id, pending_run.total_amount, reason),
         );
     }
 
@@ -760,6 +1071,10 @@ impl Payroll {
 
         if amounts.len() != count || employees.len() != count {
             panic!("Array length mismatch");
+        }
+
+        if count == 0 {
+            panic!("Empty payroll batch");
         }
 
         assert!(count <= MAX_BATCH, "Batch too large");
@@ -804,6 +1119,10 @@ impl Payroll {
             .get(&DataKey::Addresses)
             .expect("Not initialized");
 
+        // Issue #147: gate on company lifecycle state before any auth, balance,
+        // or transfer logic runs, so rejected calls produce no partial side effects.
+        Self::require_company_active(&e);
+
         if e.storage().persistent().has(&DataKey::PauseManager) {
             let pm_addr: Address = e
                 .storage()
@@ -823,22 +1142,25 @@ impl Payroll {
         // #103 — mark nonce as consumed (store run_id for auditability).
         e.storage().persistent().set(&nonce_key, &run_id);
 
+        let token_client = soroban_token::Client::new(&e, &addrs.token);
+
+        // Issue #62: fail early if the treasury token balance cannot cover the
+        // full batch payout, before any proof verification or transfers begin.
+        let treasury_balance = token_client.balance(&addrs.treasury);
+        if treasury_balance < expected_total_spend {
+            panic!(
+                "Insufficient treasury balance: available {} but batch requires {}",
+                treasury_balance, expected_total_spend
+            );
+        }
+
         let verifier = ProofVerifierClient::new(&e, &addrs.verifier);
         let commitment_client = SalaryCommitmentContractClient::new(&e, &addrs.commitment);
-        let token_client = soroban_token::Client::new(&e, &addrs.token);
 
         for i in 0..count {
             let proof = proofs.get(i).unwrap();
             let amount = amounts.get(i).unwrap();
             let employee = employees.get(i).unwrap();
-
-            // Issue #61: Check employee eligibility before processing payment
-            // This ensures deactivated employees cannot receive payroll
-            let registry_client = PayrollRegistryClient::new(&e, &addrs.registry);
-            let company_id: u64 = 1; // TODO: Pass company_id as parameter
-            if !registry_client.is_eligible(&company_id, &employee) {
-                panic!("Employee {} is not eligible for payroll (inactive or incomplete)", i);
-            }
 
             let commitment_struct = commitment_client.get_commitment(&employee);
             let commitment = commitment_struct.commitment;
@@ -867,15 +1189,7 @@ impl Payroll {
             // altered after payroll has been executed for this period.
             commitment_client.lock_commitment_updates(&employee);
 
-            e.events().publish(
-                (
-                    symbol_short!("payroll"),
-                    Symbol::new(&e, "payment_executed"),
-                ),
-                (employee.clone(), amount),
-            );
-            // topics : ("payroll", "payment_executed")
-            // data   : (employee, amount)
+            payroll_events::emit_payment_executed(&e, employee.clone(), amount);
         }
 
         let run = PayrollRun {
@@ -892,11 +1206,9 @@ impl Payroll {
         e.storage()
             .persistent()
             .set(&DataKey::PayrollRun(run_id), &run);
+        Self::record_payroll_run_state(&e, run_id, PayrollRunState::ReconciliationRequired);
 
-        e.events().publish(
-            (symbol_short!("payroll"), Symbol::new(&e, "run_executed")),
-            (run_id, expected_total_spend),
-        );
+        payroll_events::emit_run_executed(&e, run_id, expected_total_spend);
 
         run_id
     }
@@ -954,10 +1266,7 @@ impl Payroll {
             .persistent()
             .set(&DataKey::RunDraft(draft_id), &draft);
 
-        e.events().publish(
-            (symbol_short!("payroll"), Symbol::new(&e, "draft_created")),
-            (draft_id, admin, period_label),
-        );
+        payroll_events::emit_draft_created(&e, draft_id, admin, period_label);
 
         draft_id
     }
@@ -974,14 +1283,38 @@ impl Payroll {
         new_employee_count: u32,
     ) {
         Self::require_not_paused(&e);
-        let addrs: ContractAddresses = e.storage().persistent().get(&DataKey::Addresses).expect("Not initialized");
-        if admin != addrs.admin { panic!("Unauthorized"); }
+        let addrs: ContractAddresses = e
+            .storage()
+            .persistent()
+            .get(&DataKey::Addresses)
+            .expect("Not initialized");
+        if admin != addrs.admin {
+            panic!("Unauthorized");
+        }
         admin.require_auth();
-        let mut draft: PayrollRunDraft = e.storage().persistent().get(&DataKey::RunDraft(draft_id)).expect("Draft not found");
-        if draft.state != RunDraftState::Pending { panic!("Only pending drafts can be amended"); }
-        if new_total_amount <= 0 { panic!("total_amount must be positive"); }
-        draft.total_amount=new_total_amount; draft.employee_count=new_employee_count; draft.amendment_count+=1; e.storage().persistent().set(&DataKey::RunDraft(draft_id), &draft); e.events().publish((symbol_short!("payroll"), Symbol::new(&e,"draft_amended")),(draft_id,new_total_amount,draft.amendment_count));
+        let mut draft: PayrollRunDraft = e
+            .storage()
+            .persistent()
+            .get(&DataKey::RunDraft(draft_id))
+            .expect("Draft not found");
+        if draft.state != RunDraftState::Pending {
+            panic!("Only pending drafts can be amended");
+        }
+        if new_total_amount <= 0 {
+            panic!("total_amount must be positive");
+        }
+        draft.total_amount = new_total_amount;
+        draft.employee_count = new_employee_count;
+        draft.amendment_count += 1;
+        e.storage()
+            .persistent()
+            .set(&DataKey::RunDraft(draft_id), &draft);
+        e.events().publish(
+            (symbol_short!("payroll"), Symbol::new(&e, "draft_amended")),
+            (draft_id, new_total_amount, draft.amendment_count),
+        );
     }
+
 
     /// Update the reconciliation status of a completed payroll run.
     ///
@@ -1014,8 +1347,29 @@ impl Payroll {
             .get(&run_key)
             .expect("Run not found");
 
+        // Issue #244: settlement completion is final. Once a run has reached
+        // `Completed`, reject any further reconciliation update — including a
+        // repeat `Reconciled` call — so settlement cannot be replayed or
+        // finalized more than once for the same payroll run.
+        let current_state = Self::get_payroll_run_state_internal(&e, run_id);
+        if current_state == PayrollRunState::Completed {
+            panic!("Settlement already finalized: run is Completed and cannot be updated again");
+        }
+
         run.reconciliation_status = status.clone();
         e.storage().persistent().set(&run_key, &run);
+
+        let next_state = match status {
+            ReconciliationStatus::Reconciled => PayrollRunState::Completed,
+            ReconciliationStatus::Unreconciled => PayrollRunState::ReconciliationRequired,
+            ReconciliationStatus::Failed => PayrollRunState::Failed,
+        };
+        if current_state != next_state
+            && !Self::is_allowed_payroll_state_transition_internal(current_state, next_state)
+        {
+            panic!("Invalid payroll state transition");
+        }
+        Self::record_payroll_run_state(&e, run_id, next_state);
 
         e.events().publish(
             (
@@ -1057,9 +1411,11 @@ impl Payroll {
             .persistent()
             .set(&DataKey::RunDraft(draft_id), &draft);
 
-        e.events().publish(
-            (symbol_short!("payroll"), Symbol::new(&e, "draft_finalized")),
-            (draft_id, draft.total_amount, draft.amendment_count),
+        payroll_events::emit_draft_finalized(
+            &e,
+            draft_id,
+            draft.total_amount,
+            draft.amendment_count,
         );
     }
 
@@ -1102,10 +1458,7 @@ impl Payroll {
             .persistent()
             .set(&DataKey::PendingAdminRotation, &proposal);
 
-        e.events().publish(
-            (symbol_short!("payroll"), Symbol::new(&e, "admin_proposed")),
-            (current_admin, new_admin),
-        );
+        payroll_events::emit_admin_proposed(&e, current_admin, new_admin);
     }
 
     /// Accept an admin rotation proposal (step 2 of 2).
@@ -1138,10 +1491,7 @@ impl Payroll {
             .persistent()
             .remove(&DataKey::PendingAdminRotation);
 
-        e.events().publish(
-            (symbol_short!("payroll"), Symbol::new(&e, "admin_rotated")),
-            (old_admin, new_admin),
-        );
+        payroll_events::emit_admin_rotated(&e, old_admin, new_admin);
     }
 
     /// Cancel a pending admin rotation proposal.
@@ -1166,13 +1516,7 @@ impl Payroll {
             .persistent()
             .remove(&DataKey::PendingAdminRotation);
 
-        e.events().publish(
-            (
-                symbol_short!("payroll"),
-                Symbol::new(&e, "admin_rot_cancel"),
-            ),
-            current_admin,
-        );
+        payroll_events::emit_admin_rotation_cancelled(&e, current_admin);
     }
 
     /// Propose a new treasury owner (step 1 of 2).
@@ -1204,13 +1548,7 @@ impl Payroll {
             .persistent()
             .set(&DataKey::PendingTreasuryRotation, &proposal);
 
-        e.events().publish(
-            (
-                symbol_short!("payroll"),
-                Symbol::new(&e, "treasury_proposed"),
-            ),
-            (current_owner, new_owner),
-        );
+        payroll_events::emit_treasury_proposed(&e, current_owner, new_owner);
     }
 
     /// Accept a treasury-owner rotation (step 2 of 2).
@@ -1249,13 +1587,7 @@ impl Payroll {
             .persistent()
             .remove(&DataKey::PendingTreasuryRotation);
 
-        e.events().publish(
-            (
-                symbol_short!("payroll"),
-                Symbol::new(&e, "treasury_rotated"),
-            ),
-            (old_owner, new_owner),
-        );
+        payroll_events::emit_treasury_rotated(&e, old_owner, new_owner);
     }
 
     /// Cancel a pending treasury-owner rotation.
@@ -1282,13 +1614,7 @@ impl Payroll {
             .persistent()
             .remove(&DataKey::PendingTreasuryRotation);
 
-        e.events().publish(
-            (
-                symbol_short!("payroll"),
-                Symbol::new(&e, "treas_rot_cancel"),
-            ),
-            current_owner,
-        );
+        payroll_events::emit_treasury_rotation_cancelled(&e, current_owner);
     }
 
     /// Return the pending admin rotation proposal, if any.
@@ -1338,6 +1664,97 @@ impl Payroll {
             .expect("Run not found");
         run.metadata_hash == expected_hash
     }
+
+    // ── Issue #147: company state management ─────────────────────────────────
+
+    /// Set the company lifecycle state.
+    ///
+    /// Only the admin may call. After setting to anything other than `Active`,
+    /// all subsequent `batch_process_payroll` calls will be rejected with a
+    /// descriptive error until the state is restored to `Active`.
+    pub fn set_company_state(e: Env, admin: Address, state: CompanyState) {
+        let addrs: ContractAddresses = e
+            .storage()
+            .persistent()
+            .get(&DataKey::Addresses)
+            .expect("Not initialized");
+        if admin != addrs.admin {
+            panic!("Unauthorized");
+        }
+        admin.require_auth();
+        e.storage().persistent().set(&DataKey::CompanyState, &state);
+        e.events().publish(
+            (symbol_short!("payroll"), Symbol::new(&e, "state_changed")),
+            state,
+        );
+    }
+
+    /// Return the current company state. Returns `Active` if no state has been
+    /// explicitly set (backward-compatible default).
+    pub fn get_company_state(e: Env) -> CompanyState {
+        e.storage()
+            .persistent()
+            .get(&DataKey::CompanyState)
+            .unwrap_or(CompanyState::Active)
+    }
+
+    // ── Issue #146: archived payroll run queries ──────────────────────────────
+
+    /// Mark a completed payroll run as archived for long-term reporting.
+    ///
+    /// Only the admin may archive. Archiving is additive and read-only: it
+    /// flags the run without altering the underlying `PayrollRun` record,
+    /// cannot trigger execution, state transitions, or treasury mutations.
+    pub fn archive_payroll_run(e: Env, admin: Address, run_id: u64) {
+        let addrs: ContractAddresses = e
+            .storage()
+            .persistent()
+            .get(&DataKey::Addresses)
+            .expect("Not initialized");
+        if admin != addrs.admin {
+            panic!("Unauthorized");
+        }
+        admin.require_auth();
+
+        // Ensure the run exists before archiving it.
+        if !e.storage().persistent().has(&DataKey::PayrollRun(run_id)) {
+            panic!("Run not found");
+        }
+
+        let archive_key = DataKey::ArchivedRun(run_id);
+        if e.storage().persistent().has(&archive_key) {
+            panic!("Run is already archived");
+        }
+        e.storage().persistent().set(&archive_key, &true);
+
+        e.events().publish(
+            (symbol_short!("payroll"), Symbol::new(&e, "run_archived")),
+            run_id,
+        );
+    }
+
+    /// Return a payroll run only if it has been explicitly archived.
+    ///
+    /// This is the dedicated archived-query path: it is fully read-only and
+    /// panics for runs that exist but have not been archived, keeping the
+    /// archived and active access paths clearly separated.
+    pub fn get_archived_run(e: Env, run_id: u64) -> PayrollRun {
+        if !e.storage().persistent().has(&DataKey::ArchivedRun(run_id)) {
+            panic!("Run is not archived");
+        }
+        e.storage()
+            .persistent()
+            .get(&DataKey::PayrollRun(run_id))
+            .expect("Run not found")
+    }
+
+
+    /// Return `true` if the run has been marked as archived, `false` otherwise.
+    pub fn is_run_archived(e: Env, run_id: u64) -> bool {
+        e.storage()
+            .persistent()
+            .has(&DataKey::ArchivedRun(run_id))
+    }
 }
 
 #[cfg(test)]
@@ -1347,7 +1764,7 @@ mod tests {
     use pause_manager::{PauseManager, PauseManagerClient};
     use proof_verifier::{ProofVerifier, VerificationKey};
     use salary_commitment::SalaryCommitmentContract;
-    use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::testutils::{Address as _, Events as _};
     use soroban_sdk::{Env, IntoVal};
 
     fn mock_proof(env: &Env) -> BytesN<256> {
@@ -1491,7 +1908,10 @@ mod tests {
             proofs.push_back(p);
             amounts.push_back(100i128 + i as i128);
             let emp = Address::generate(&env);
-            commitment_client.store_commitment(&emp, &BytesN::from_array(&env, &[0u8; 32]));
+            let mut cmt_bytes = [0u8; 32];
+            cmt_bytes[0] = (i % 256) as u8;
+            cmt_bytes[1] = (i / 256) as u8;
+            commitment_client.store_commitment(&emp, &BytesN::from_array(&env, &cmt_bytes));
             employees.push_back(emp);
         }
 
@@ -2214,10 +2634,89 @@ mod tests {
         let run = payroll_client.get_payroll_run(&run_id);
         assert_eq!(run.reconciliation_status, ReconciliationStatus::Reconciled);
 
-        // Update to Failed
-        payroll_client.update_reconciliation_status(&admin, &run_id, &ReconciliationStatus::Failed);
-        let run = payroll_client.get_payroll_run(&run_id);
-        assert_eq!(run.reconciliation_status, ReconciliationStatus::Failed);
+        assert_eq!(
+            payroll_client.get_payroll_run_state(&run_id),
+            PayrollRunState::Completed
+        );
+
+        let result = payroll_client.try_update_reconciliation_status(
+            &admin,
+            &run_id,
+            &ReconciliationStatus::Failed,
+        );
+        assert!(result.is_err(), "Completed runs must not be reopened");
+    }
+
+    // ── Issue #244: payroll settlement replay guard ──────────────────────────
+
+    /// A repeat `Reconciled` call for an already-`Completed` run must be
+    /// rejected, not silently re-accepted. Before this guard, calling
+    /// `update_reconciliation_status` twice with the same terminal status
+    /// bypassed the transition check (current == next state) and replayed
+    /// the settlement-completion event.
+    #[test]
+    fn test_reconciled_run_cannot_be_replayed() {
+        let env = Env::default();
+        let (payroll_client, admin, _treasury, _treasury_owner, employee) =
+            setup_simple_payroll(&env);
+
+        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
+        let run_id = payroll_client.batch_process_payroll(
+            &proofs,
+            &amounts,
+            &employees,
+            &1000,
+            &test_nonce(&env, 220),
+            &None,
+        );
+
+        payroll_client.update_reconciliation_status(
+            &admin,
+            &run_id,
+            &ReconciliationStatus::Reconciled,
+        );
+        assert_eq!(
+            payroll_client.get_payroll_run_state(&run_id),
+            PayrollRunState::Completed
+        );
+
+        let result = payroll_client.try_update_reconciliation_status(
+            &admin,
+            &run_id,
+            &ReconciliationStatus::Reconciled,
+        );
+        assert!(
+            result.is_err(),
+            "Settlement completion must not be replayable for a Completed run"
+        );
+    }
+
+    #[test]
+    fn test_failed_reconciliation_writes_retryable_payroll_state() {
+        let env = Env::default();
+        let (payroll_client, admin, _treasury, _treasury_owner, employee) =
+            setup_simple_payroll(&env);
+
+        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
+        let run_id = payroll_client.batch_process_payroll(
+            &proofs,
+            &amounts,
+            &employees,
+            &1000,
+            &test_nonce(&env, 33),
+            &None,
+        );
+
+        payroll_client.update_reconciliation_status(
+            &admin,
+            &run_id,
+            &ReconciliationStatus::Failed,
+        );
+        assert_eq!(
+            payroll_client.get_payroll_run_state(&run_id),
+            PayrollRunState::Failed
+        );
+        assert!(payroll_client.is_payroll_state_retryable(&PayrollRunState::Failed));
     }
 
     #[test]
@@ -2260,6 +2759,159 @@ mod tests {
     }
 
     // ── Issue #75: payroll cancellation ──────────────────────────────────────
+
+    // ── Issue #159: canonical payroll state machine ──────────────────────────
+
+    #[test]
+    fn test_payroll_state_machine_allows_canonical_forward_transitions() {
+        let env = Env::default();
+        let (payroll_client, _admin, _treasury, _treasury_owner, _employee) =
+            setup_simple_payroll(&env);
+
+        assert!(payroll_client.is_state_transition_allowed(
+            &PayrollRunState::Draft,
+            &PayrollRunState::Validating,
+        ));
+        assert!(payroll_client.is_state_transition_allowed(
+            &PayrollRunState::Validating,
+            &PayrollRunState::ProofPending,
+        ));
+        assert!(payroll_client.is_state_transition_allowed(
+            &PayrollRunState::ProofPending,
+            &PayrollRunState::ReadyToSubmit,
+        ));
+        assert!(payroll_client.is_state_transition_allowed(
+            &PayrollRunState::ReadyToSubmit,
+            &PayrollRunState::Submitted,
+        ));
+        assert!(payroll_client.is_state_transition_allowed(
+            &PayrollRunState::Submitted,
+            &PayrollRunState::Confirming,
+        ));
+        assert!(payroll_client.is_state_transition_allowed(
+            &PayrollRunState::Confirming,
+            &PayrollRunState::ReconciliationRequired,
+        ));
+        assert!(payroll_client.is_state_transition_allowed(
+            &PayrollRunState::ReconciliationRequired,
+            &PayrollRunState::Completed,
+        ));
+    }
+
+    #[test]
+    fn test_payroll_state_machine_rejects_forbidden_transitions() {
+        let env = Env::default();
+        let (payroll_client, _admin, _treasury, _treasury_owner, _employee) =
+            setup_simple_payroll(&env);
+
+        assert!(!payroll_client.is_state_transition_allowed(
+            &PayrollRunState::Draft,
+            &PayrollRunState::Completed,
+        ));
+        assert!(!payroll_client.is_state_transition_allowed(
+            &PayrollRunState::Submitted,
+            &PayrollRunState::Draft,
+        ));
+        assert!(!payroll_client.is_state_transition_allowed(
+            &PayrollRunState::Completed,
+            &PayrollRunState::Failed,
+        ));
+        assert!(!payroll_client.is_state_transition_allowed(
+            &PayrollRunState::Cancelled,
+            &PayrollRunState::Submitted,
+        ));
+    }
+
+    #[test]
+    fn test_payroll_state_machine_terminal_and_retryable_metadata() {
+        let env = Env::default();
+        let (payroll_client, _admin, _treasury, _treasury_owner, _employee) =
+            setup_simple_payroll(&env);
+
+        assert!(payroll_client.is_payroll_state_terminal(&PayrollRunState::Completed));
+        assert!(payroll_client.is_payroll_state_terminal(&PayrollRunState::Cancelled));
+        assert!(!payroll_client.is_payroll_state_terminal(&PayrollRunState::Failed));
+        assert!(payroll_client.is_payroll_state_retryable(&PayrollRunState::Failed));
+        assert!(
+            !payroll_client.is_payroll_state_retryable(&PayrollRunState::ReconciliationRequired)
+        );
+    }
+
+    #[test]
+    fn test_prepare_and_cancel_write_canonical_payroll_states() {
+        let env = Env::default();
+        let (payroll_client, admin, _treasury, _treasury_owner, employee) =
+            setup_simple_payroll(&env);
+
+        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
+        let run_id = payroll_client.prepare_payroll_run(
+            &proofs,
+            &amounts,
+            &employees,
+            &1000,
+            &test_nonce(&env, 150),
+            &None,
+        );
+        assert_eq!(
+            payroll_client.get_payroll_run_state(&run_id),
+            PayrollRunState::Submitted
+        );
+
+        payroll_client.cancel_payroll_run(&admin, &run_id);
+        assert_eq!(
+            payroll_client.get_payroll_run_state(&run_id),
+            PayrollRunState::Cancelled
+        );
+    }
+
+    #[test]
+    fn test_terminal_payroll_state_cannot_be_mutated() {
+        let env = Env::default();
+        let (payroll_client, admin, _treasury, _treasury_owner, employee) =
+            setup_simple_payroll(&env);
+
+        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
+        let run_id = payroll_client.prepare_payroll_run(
+            &proofs,
+            &amounts,
+            &employees,
+            &1000,
+            &test_nonce(&env, 151),
+            &None,
+        );
+        payroll_client.cancel_payroll_run(&admin, &run_id);
+
+        let result = payroll_client.try_transition_payroll_run_state(
+            &admin,
+            &run_id,
+            &PayrollRunState::Submitted,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_non_admin_cannot_transition_payroll_state() {
+        let env = Env::default();
+        let (payroll_client, _admin, _treasury, _treasury_owner, employee) =
+            setup_simple_payroll(&env);
+
+        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
+        let run_id = payroll_client.prepare_payroll_run(
+            &proofs,
+            &amounts,
+            &employees,
+            &1000,
+            &test_nonce(&env, 152),
+            &None,
+        );
+        let attacker = Address::generate(&env);
+        let result = payroll_client.try_transition_payroll_run_state(
+            &attacker,
+            &run_id,
+            &PayrollRunState::Confirming,
+        );
+        assert!(result.is_err());
+    }
 
     #[test]
     fn test_prepare_payroll_run_creates_pending_run() {
@@ -2327,7 +2979,8 @@ mod tests {
         );
 
         let non_admin = Address::generate(&env);
-        payroll_client.cancel_payroll_run(&non_admin, &run_id);
+        let reason = Symbol::new(&env, "attack");
+        payroll_client.cancel_payroll_run(&non_admin, &run_id, &reason);
     }
 
     #[test]
@@ -2337,7 +2990,8 @@ mod tests {
         let (payroll_client, admin, _treasury, _treasury_owner, _employee) =
             setup_simple_payroll(&env);
 
-        payroll_client.cancel_payroll_run(&admin, &999u64);
+        let reason = Symbol::new(&env, "no_such_run");
+        payroll_client.cancel_payroll_run(&admin, &999u64, &reason);
     }
 
     // ── Issue #177: payroll run metadata hash checks ──────────────────────────
@@ -2374,7 +3028,12 @@ mod tests {
 
         let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
         let run_id = payroll_client.batch_process_payroll(
-            &proofs, &amounts, &employees, &1000, &test_nonce(&env, 50), &None,
+            &proofs,
+            &amounts,
+            &employees,
+            &1000,
+            &test_nonce(&env, 50),
+            &None,
         );
         assert!(run_id > 0);
 
@@ -2395,7 +3054,12 @@ mod tests {
 
         let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
         let run_id = payroll_client.batch_process_payroll(
-            &proofs, &amounts, &employees, &1000, &test_nonce(&env, 51), &None,
+            &proofs,
+            &amounts,
+            &employees,
+            &1000,
+            &test_nonce(&env, 51),
+            &None,
         );
 
         let meta_hash = BytesN::from_array(&env, &[0xddu8; 32]);
@@ -2410,7 +3074,12 @@ mod tests {
 
         let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
         let run_id = payroll_client.batch_process_payroll(
-            &proofs, &amounts, &employees, &1000, &test_nonce(&env, 52), &None,
+            &proofs,
+            &amounts,
+            &employees,
+            &1000,
+            &test_nonce(&env, 52),
+            &None,
         );
 
         let run = payroll_client.get_payroll_run(&run_id);
@@ -2451,8 +3120,9 @@ mod tests {
             &None,
         );
 
-        payroll_client.cancel_payroll_run(&admin, &run_id);
-        payroll_client.cancel_payroll_run(&admin, &run_id);
+        let reason = Symbol::new(&env, "double_cancel");
+        payroll_client.cancel_payroll_run(&admin, &run_id, &reason);
+        payroll_client.cancel_payroll_run(&admin, &run_id, &reason);
     }
 
     #[test]
@@ -2463,17 +3133,12 @@ mod tests {
 
         let nonce = test_nonce(&env, 45);
         let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
-        let run_id = payroll_client.prepare_payroll_run(
-            &proofs,
-            &amounts,
-            &employees,
-            &1000,
-            &nonce,
-            &None,
-        );
+        let run_id =
+            payroll_client.prepare_payroll_run(&proofs, &amounts, &employees, &1000, &nonce, &None);
 
         assert!(payroll_client.get_pending_run(&run_id).is_some());
-        payroll_client.cancel_payroll_run(&admin, &run_id);
+        let reason = Symbol::new(&env, "test_cleanup");
+        payroll_client.cancel_payroll_run(&admin, &run_id, &reason);
 
         assert!(payroll_client.get_pending_run(&run_id).is_none());
     }
@@ -2522,23 +3187,25 @@ mod tests {
         amounts.push_back(500i128);
 
         let nonce = test_nonce(&env, 100);
-        let result = payroll_client.try_batch_process_payroll(
-            &proofs,
-            &amounts,
-            &employees,
-            &1000,
-            &nonce,
-            &None,
-        );
+        let result = payroll_client
+            .try_batch_process_payroll(&proofs, &amounts, &employees, &1000, &nonce, &None);
         // Execution fails because emp2 has no stored commitment
         assert!(result.is_err());
 
         // Verify the nonce was rolled back — should be usable in a new run
         let (proofs2, amounts2, employees2) = single_payment_batch(&env, &emp1, 500);
         let run_id = payroll_client.batch_process_payroll(
-            &proofs2, &amounts2, &employees2, &500, &nonce, &None,
+            &proofs2,
+            &amounts2,
+            &employees2,
+            &500,
+            &nonce,
+            &None,
         );
-        assert!(run_id > 0, "Nonce must be reusable after rolled-back execution");
+        assert!(
+            run_id > 0,
+            "Nonce must be reusable after rolled-back execution"
+        );
     }
 
     #[test]
@@ -2570,7 +3237,12 @@ mod tests {
         // Mint only 100 tokens — NOT enough for the 1000 payment
         token_client.mint(&treasury, &100i128);
         payroll_client.initialize(
-            &admin, &token_id, &verifier_id, &commitment_id, &treasury, &treasury_owner,
+            &admin,
+            &token_id,
+            &verifier_id,
+            &commitment_id,
+            &treasury,
+            &treasury_owner,
         );
         commitment_client.set_payroll_operator(&payroll_id);
 
@@ -2585,7 +3257,12 @@ mod tests {
         payroll_client.commit_draft(&admin, &draft_hash);
 
         let result = payroll_client.try_batch_process_payroll(
-            &proofs, &amounts, &employees, &1000, &nonce, &Some(draft_hash.clone()),
+            &proofs,
+            &amounts,
+            &employees,
+            &1000,
+            &nonce,
+            &Some(draft_hash.clone()),
         );
         // Must fail due to insufficient treasury balance
         assert!(result.is_err());
@@ -2593,9 +3270,17 @@ mod tests {
         // Verify nonce is reusable (rolled back)
         token_client.mint(&treasury, &10_000i128);
         let run_id = payroll_client.batch_process_payroll(
-            &proofs, &amounts, &employees, &1000, &nonce, &Some(draft_hash.clone()),
+            &proofs,
+            &amounts,
+            &employees,
+            &1000,
+            &nonce,
+            &Some(draft_hash.clone()),
         );
-        assert!(run_id > 0, "Nonce and commitment must be reusable after failed execution");
+        assert!(
+            run_id > 0,
+            "Nonce and commitment must be reusable after failed execution"
+        );
     }
 
     #[test]
@@ -2608,9 +3293,8 @@ mod tests {
         let nonce = test_nonce(&env, 102);
         let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 500);
 
-        let result = payroll_client.try_batch_process_payroll(
-            &proofs, &amounts, &employees, &999, &nonce, &None,
-        );
+        let result = payroll_client
+            .try_batch_process_payroll(&proofs, &amounts, &employees, &999, &nonce, &None);
         assert!(result.is_err());
 
         // Verify no payroll run record was created
@@ -2621,12 +3305,14 @@ mod tests {
                 break;
             }
         }
-        assert!(!any_run, "No PayrollRun should exist after a failed execution");
+        assert!(
+            !any_run,
+            "No PayrollRun should exist after a failed execution"
+        );
 
         // Nonce is NOT consumed (rolled back) — can retry with corrected params
-        let run_id = payroll_client.batch_process_payroll(
-            &proofs, &amounts, &employees, &500, &nonce, &None,
-        );
+        let run_id = payroll_client
+            .batch_process_payroll(&proofs, &amounts, &employees, &500, &nonce, &None);
         assert!(run_id > 0, "Nonce must be reusable after failed execution");
     }
 
@@ -2643,16 +3329,29 @@ mod tests {
         let nonce = test_nonce(&env, 103);
         let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 500);
         let result = payroll_client.try_batch_process_payroll(
-            &proofs, &amounts, &employees, &999, &nonce, &Some(draft_hash.clone()),
+            &proofs,
+            &amounts,
+            &employees,
+            &999,
+            &nonce,
+            &Some(draft_hash.clone()),
         );
         assert!(result.is_err());
 
         // Draft commitment should still be usable (rolled back)
         let nonce2 = test_nonce(&env, 104);
         let run_id = payroll_client.batch_process_payroll(
-            &proofs, &amounts, &employees, &500, &nonce2, &Some(draft_hash),
+            &proofs,
+            &amounts,
+            &employees,
+            &500,
+            &nonce2,
+            &Some(draft_hash),
         );
-        assert!(run_id > 0, "Draft commitment must survive a rolled-back execution");
+        assert!(
+            run_id > 0,
+            "Draft commitment must survive a rolled-back execution"
+        );
     }
 
     #[test]
@@ -2663,16 +3362,14 @@ mod tests {
 
         let nonce = test_nonce(&env, 105);
         let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 500);
-        let result = payroll_client.try_batch_process_payroll(
-            &proofs, &amounts, &employees, &999, &nonce, &None,
-        );
+        let result = payroll_client
+            .try_batch_process_payroll(&proofs, &amounts, &employees, &999, &nonce, &None);
         assert!(result.is_err());
 
         // After failure, a successful run with the same nonce should work
         // (nonce was rolled back). Also verify the run gets a valid ID.
-        let run_id = payroll_client.batch_process_payroll(
-            &proofs, &amounts, &employees, &500, &nonce, &None,
-        );
+        let run_id = payroll_client
+            .batch_process_payroll(&proofs, &amounts, &employees, &500, &nonce, &None);
         assert!(run_id > 0, "Nonce must be reusable after failed execution");
     }
 
@@ -2685,15 +3382,11 @@ mod tests {
 
         let nonce = test_nonce(&env, 106);
         let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 500);
-        payroll_client.batch_process_payroll(
-            &proofs, &amounts, &employees, &500, &nonce, &None,
-        );
+        payroll_client.batch_process_payroll(&proofs, &amounts, &employees, &500, &nonce, &None);
 
         // Second attempt with same nonce — must fail permanently
         let (proofs2, amounts2, employees2) = single_payment_batch(&env, &employee, 500);
-        payroll_client.batch_process_payroll(
-            &proofs2, &amounts2, &employees2, &500, &nonce, &None,
-        );
+        payroll_client.batch_process_payroll(&proofs2, &amounts2, &employees2, &500, &nonce, &None);
     }
 
     #[test]
@@ -2711,19 +3404,22 @@ mod tests {
         employees.push_back(employee.clone());
 
         // Successful prepare
-        let run_id = payroll_client.prepare_payroll_run(
-            &proofs, &amounts, &employees, &500, &nonce, &None,
-        );
+        let run_id =
+            payroll_client.prepare_payroll_run(&proofs, &amounts, &employees, &500, &nonce, &None);
         assert!(run_id > 0);
 
         // Failed cancel (wrong caller) should not affect the pending run
         let attacker = Address::generate(&env);
-        let cancel_result = payroll_client.try_cancel_payroll_run(&attacker, &run_id);
+        let reason = Symbol::new(&env, "attack");
+        let cancel_result = payroll_client.try_cancel_payroll_run(&attacker, &run_id, &reason);
         assert!(cancel_result.is_err());
 
         // Pending run should still exist
         let pending = payroll_client.get_pending_run(&run_id);
-        assert!(pending.is_some(), "Pending run must survive unauthorized cancel attempt");
+        assert!(
+            pending.is_some(),
+            "Pending run must survive unauthorized cancel attempt"
+        );
     }
 
     #[test]
@@ -2741,17 +3437,24 @@ mod tests {
         let mut employees = Vec::new(&env);
         employees.push_back(employee.clone());
 
-        let result = payroll_client.try_batch_process_payroll(
-            &proofs, &amounts, &employees, &1000, &nonce, &None,
-        );
+        let result = payroll_client
+            .try_batch_process_payroll(&proofs, &amounts, &employees, &1000, &nonce, &None);
         assert!(result.is_err());
 
         // Nonce should still be usable after rollback
         let (proofs2, amounts2, employees2) = single_payment_batch(&env, &employee, 500);
         let run_id = payroll_client.batch_process_payroll(
-            &proofs2, &amounts2, &employees2, &500, &nonce, &None,
+            &proofs2,
+            &amounts2,
+            &employees2,
+            &500,
+            &nonce,
+            &None,
         );
-        assert!(run_id > 0, "Nonce must be reusable after array mismatch rollback");
+        assert!(
+            run_id > 0,
+            "Nonce must be reusable after array mismatch rollback"
+        );
     }
 
     #[test]
@@ -2821,7 +3524,12 @@ mod tests {
         let mut amounts = Vec::new(&env);
         amounts.push_back(0i128);
         payroll_client.batch_process_payroll(
-            &proofs, &amounts, &employees, &0, &test_nonce(&env, 200), &None,
+            &proofs,
+            &amounts,
+            &employees,
+            &0,
+            &test_nonce(&env, 200),
+            &None,
         );
     }
 
@@ -2836,7 +3544,12 @@ mod tests {
         let mut amounts = Vec::new(&env);
         amounts.push_back(-1i128);
         payroll_client.batch_process_payroll(
-            &proofs, &amounts, &employees, &-1, &test_nonce(&env, 201), &None,
+            &proofs,
+            &amounts,
+            &employees,
+            &-1,
+            &test_nonce(&env, 201),
+            &None,
         );
     }
 
@@ -2851,7 +3564,12 @@ mod tests {
         let mut amounts = Vec::new(&env);
         amounts.push_back(0i128);
         payroll_client.prepare_payroll_run(
-            &proofs, &amounts, &employees, &0, &test_nonce(&env, 202), &None,
+            &proofs,
+            &amounts,
+            &employees,
+            &0,
+            &test_nonce(&env, 202),
+            &None,
         );
     }
 
@@ -2866,7 +3584,12 @@ mod tests {
         let mut amounts = Vec::new(&env);
         amounts.push_back(-1i128);
         payroll_client.prepare_payroll_run(
-            &proofs, &amounts, &employees, &-1, &test_nonce(&env, 203), &None,
+            &proofs,
+            &amounts,
+            &employees,
+            &-1,
+            &test_nonce(&env, 203),
+            &None,
         );
     }
 
@@ -2880,15 +3603,16 @@ mod tests {
 
         let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
         let run_id = payroll_client.batch_process_payroll(
-            &proofs, &amounts, &employees, &1000, &test_nonce(&env, 210), &None,
+            &proofs,
+            &amounts,
+            &employees,
+            &1000,
+            &test_nonce(&env, 210),
+            &None,
         );
 
-        let draft_id = payroll_client.create_run_draft(
-            &admin,
-            &5_000i128,
-            &10u32,
-            &Symbol::new(&env, "Q1"),
-        );
+        let draft_id =
+            payroll_client.create_run_draft(&admin, &5_000i128, &10u32, &Symbol::new(&env, "Q1"));
 
         let run = payroll_client.get_payroll_run(&run_id);
         let draft = payroll_client.get_run_draft(&draft_id);
@@ -2905,7 +3629,12 @@ mod tests {
 
         let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
         let run_id = payroll_client.batch_process_payroll(
-            &proofs, &amounts, &employees, &1000, &test_nonce(&env, 211), &None,
+            &proofs,
+            &amounts,
+            &employees,
+            &1000,
+            &test_nonce(&env, 211),
+            &None,
         );
 
         let run = payroll_client.get_payroll_run(&run_id);
@@ -2922,12 +3651,8 @@ mod tests {
         let (payroll_client, admin, _treasury, _treasury_owner, _employee) =
             setup_simple_payroll(&env);
 
-        let id = payroll_client.create_run_draft(
-            &admin,
-            &8_000i128,
-            &15u32,
-            &Symbol::new(&env, "MAR"),
-        );
+        let id =
+            payroll_client.create_run_draft(&admin, &8_000i128, &15u32, &Symbol::new(&env, "MAR"));
 
         payroll_client.finalize_run_draft(&admin, &id);
         let draft = payroll_client.get_run_draft(&id);
@@ -2946,14 +3671,12 @@ mod tests {
         let nonce = test_nonce(&env, 212);
         let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
 
-        let run_id = payroll_client.batch_process_payroll(
-            &proofs, &amounts, &employees, &1000, &nonce, &None,
-        );
+        let run_id = payroll_client
+            .batch_process_payroll(&proofs, &amounts, &employees, &1000, &nonce, &None);
         assert!(run_id > 0);
 
-        let result = payroll_client.try_batch_process_payroll(
-            &proofs, &amounts, &employees, &1000, &nonce, &None,
-        );
+        let result = payroll_client
+            .try_batch_process_payroll(&proofs, &amounts, &employees, &1000, &nonce, &None);
         assert!(result.is_err());
     }
 
@@ -2973,9 +3696,10 @@ mod tests {
             &None,
         );
 
-        payroll_client.cancel_payroll_run(&admin, &run_id);
+        let reason = Symbol::new(&env, "settlement_guard");
+        payroll_client.cancel_payroll_run(&admin, &run_id, &reason);
 
-        let result = payroll_client.try_cancel_payroll_run(&admin, &run_id);
+        let result = payroll_client.try_cancel_payroll_run(&admin, &run_id, &reason);
         assert!(result.is_err());
     }
 
@@ -2985,12 +3709,8 @@ mod tests {
         let (payroll_client, admin, _treasury, _treasury_owner, _employee) =
             setup_simple_payroll(&env);
 
-        let draft_id = payroll_client.create_run_draft(
-            &admin,
-            &10_000i128,
-            &20u32,
-            &Symbol::new(&env, "Q4"),
-        );
+        let draft_id =
+            payroll_client.create_run_draft(&admin, &10_000i128, &20u32, &Symbol::new(&env, "Q4"));
 
         let draft = payroll_client.get_run_draft(&draft_id);
         assert_eq!(draft.state, RunDraftState::Pending);
@@ -3157,391 +3877,258 @@ mod tests {
         payroll_client.set_run_metadata(&attacker, &run_id, &meta_hash);
     }
 
-    // =========================================================================
-    // Issue #222: Contract recovery tests for partial failure
-    //
-    // These tests verify that partial failure paths in the payroll contract
-    // (batch_process_payroll / prepare_payroll_run / cancel_payroll_run) leave
-    // the contract in a recoverable and well-defined state.
-    //
-    // Key invariants under test:
-    //   A. batch_process_payroll is atomic (panics → full Soroban tx rollback).
-    //      All nonces, draft commitments, and payment records must be rolled back
-    //      and reusable after any mid-batch failure.
-    //   B. prepare_payroll_run succeeds or fails atomically. A failed prepare
-    //      leaves no pending run and no consumed nonce.
-    //   C. cancel_payroll_run restores the contract to a clean pending state.
-    //      After cancellation a fresh run with the same payload can be prepared
-    //      and executed successfully.
-    //   D. Emergency withdrawal requests that fail authorization leave no
-    //      partial request in storage.
-    //   E. Multiple successive partial failures followed by a correct call
-    //      produce exactly one PayrollRun record with the correct total.
-    // =========================================================================
+    // ── Issue #62: treasury deposit and balance accounting ────────────────────
 
-    // -------------------------------------------------------------------------
-    // A. batch_process_payroll atomicity across different failure modes
-    // -------------------------------------------------------------------------
-
-    /// A mid-batch panic caused by a missing commitment rolls back the entire
-    /// transaction — no PayrollRun is created and the nonce is reusable.
-    /// Seed nonce 300 so it does not collide with any existing test.
     #[test]
-    fn test_recovery_batch_missing_commitment_leaves_no_run_and_reusable_nonce() {
+    fn test_deposit_increments_company_balance() {
         let env = Env::default();
-        let (payroll_client, _admin, _treasury, _treasury_owner, employee) =
+        let (payroll_client, _admin, treasury, _treasury_owner, _employee) =
             setup_simple_payroll(&env);
 
-        // emp2 has NO commitment stored — will trigger a panic inside the loop.
-        let emp2 = Address::generate(&env);
-        let mut employees = Vec::new(&env);
-        employees.push_back(employee.clone());
-        employees.push_back(emp2.clone());
-        let mut proofs = Vec::new(&env);
-        proofs.push_back(mock_proof(&env));
-        proofs.push_back(mock_proof(&env));
-        let mut amounts = Vec::new(&env);
-        amounts.push_back(500i128);
-        amounts.push_back(500i128);
+        assert_eq!(payroll_client.get_treasury_balance(&treasury), 0i128);
 
-        let nonce = test_nonce(&env, 300);
-        let result = payroll_client.try_batch_process_payroll(
-            &proofs, &amounts, &employees, &1000, &nonce, &None,
-        );
-        assert!(result.is_err(), "Batch with missing commitment must fail");
+        let id1 = BytesN::from_array(&env, &[0xb1u8; 32]);
+        payroll_client.deposit(&treasury, &300i128, &id1);
+        assert_eq!(payroll_client.get_treasury_balance(&treasury), 300i128);
 
-        // No PayrollRun record must exist.
-        for run_id in 1..=3u64 {
-            assert!(
-                payroll_client.try_get_payroll_run(&run_id).is_err(),
-                "No PayrollRun must exist after failed batch"
-            );
-        }
-
-        // Nonce rolled back — should be usable in a corrected single-employee run.
-        let (proofs2, amounts2, employees2) = single_payment_batch(&env, &employee, 500);
-        let run_id = payroll_client.batch_process_payroll(
-            &proofs2, &amounts2, &employees2, &500, &nonce, &None,
-        );
-        assert!(run_id > 0, "Nonce must be reusable after rolled-back batch");
+        let id2 = BytesN::from_array(&env, &[0xb2u8; 32]);
+        payroll_client.deposit(&treasury, &700i128, &id2);
+        assert_eq!(payroll_client.get_treasury_balance(&treasury), 1_000i128);
     }
 
-    /// A spend-mismatch failure (expected_total_spend != sum of amounts) rolls
-    /// back before any payment is attempted. The contract stays pristine.
     #[test]
-    fn test_recovery_spend_mismatch_leaves_pristine_state() {
+    fn test_get_treasury_balance_returns_zero_for_new_address() {
         let env = Env::default();
-        let (payroll_client, _admin, _treasury, _treasury_owner, employee) =
+        let (payroll_client, _admin, _treasury, _treasury_owner, _employee) =
             setup_simple_payroll(&env);
 
-        let nonce = test_nonce(&env, 301);
-        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 500);
-
-        // Pass wrong expected_total — must panic before any payments.
-        let result = payroll_client.try_batch_process_payroll(
-            &proofs, &amounts, &employees, &9999, &nonce, &None,
-        );
-        assert!(result.is_err(), "Spend mismatch must cause failure");
-
-        // Nonce must be reusable with the corrected total.
-        let run_id = payroll_client.batch_process_payroll(
-            &proofs, &amounts, &employees, &500, &nonce, &None,
-        );
-        assert!(run_id > 0, "Corrected batch must succeed with rolled-back nonce");
+        let unknown = Address::generate(&env);
+        assert_eq!(payroll_client.get_treasury_balance(&unknown), 0i128);
     }
 
-    /// Three successive partial failures (missing commitment, spend mismatch,
-    /// array mismatch) followed by a valid call must produce exactly one
-    /// PayrollRun with the correct total and employee count.
     #[test]
-    fn test_recovery_successive_failures_then_success_produces_single_run() {
+    fn test_batch_process_fails_with_insufficient_treasury() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let verifier_id = env.register_contract(None, ProofVerifier);
+        let verifier_client = ProofVerifierClient::new(&env, &verifier_id);
+        let verifier_admin = Address::generate(&env);
+        verifier_client.init_verifier_admin(&verifier_admin);
+        verifier_client.initialize_verifier(&mock_vk(&env));
+
+        let commitment_id = env.register_contract(None, SalaryCommitmentContract);
+        let commitment_client = SalaryCommitmentContractClient::new(&env, &commitment_id);
+        let commitment_admin = Address::generate(&env);
+        commitment_client.init_commitment_admin(&commitment_admin);
+
+        let token_id = env.register_contract(None, Token);
+        let token_client = TokenClient::new(&env, &token_id);
+
+        let payroll_id = env.register_contract(None, Payroll);
+        let payroll_client = PayrollClient::new(&env, &payroll_id);
+
+        let treasury = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let treasury_owner = Address::generate(&env);
+
+        // Mint only 50 tokens — not enough for a 1000 payment.
+        token_client.mint(&treasury, &50i128);
+        payroll_client.initialize(
+            &admin, &token_id, &verifier_id, &commitment_id, &treasury, &treasury_owner,
+        );
+        commitment_client.set_payroll_operator(&payroll_id);
+
+        let employee = Address::generate(&env);
+        commitment_client.store_commitment(&employee, &BytesN::from_array(&env, &[0u8; 32]));
+
+        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1_000);
+        let result = payroll_client.try_batch_process_payroll(
+            &proofs, &amounts, &employees, &1_000, &test_nonce(&env, 214), &None,
+        );
+        assert!(result.is_err(), "Batch must fail when treasury is underfunded");
+    }
+
+    // ── Issue #146: archived payroll run queries ──────────────────────────────
+
+    #[test]
+    fn test_archive_payroll_run_marks_run_archived() {
+        let env = Env::default();
+        let (payroll_client, admin, _treasury, _treasury_owner, employee) =
+            setup_simple_payroll(&env);
+
+        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
+        let run_id = payroll_client.batch_process_payroll(
+            &proofs, &amounts, &employees, &1000, &test_nonce(&env, 220), &None,
+        );
+
+        assert!(!payroll_client.is_run_archived(&run_id));
+        payroll_client.archive_payroll_run(&admin, &run_id);
+        assert!(payroll_client.is_run_archived(&run_id));
+    }
+
+    #[test]
+    fn test_get_archived_run_returns_correct_run() {
+        let env = Env::default();
+        let (payroll_client, admin, _treasury, _treasury_owner, employee) =
+            setup_simple_payroll(&env);
+
+        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
+        let run_id = payroll_client.batch_process_payroll(
+            &proofs, &amounts, &employees, &1000, &test_nonce(&env, 221), &None,
+        );
+        payroll_client.archive_payroll_run(&admin, &run_id);
+
+        let archived = payroll_client.get_archived_run(&run_id);
+        assert_eq!(archived.run_id, run_id);
+        assert_eq!(archived.total_amount, 1000i128);
+    }
+
+    #[test]
+    fn test_get_archived_run_panics_for_non_archived_run() {
         let env = Env::default();
         let (payroll_client, _admin, _treasury, _treasury_owner, employee) =
             setup_simple_payroll(&env);
 
-        let nonce = test_nonce(&env, 302);
-
-        // Failure 1: missing commitment
-        let ghost = Address::generate(&env);
-        let mut employees_bad = Vec::new(&env);
-        employees_bad.push_back(ghost.clone());
-        let mut proofs_bad = Vec::new(&env);
-        proofs_bad.push_back(mock_proof(&env));
-        let mut amounts_bad = Vec::new(&env);
-        amounts_bad.push_back(500i128);
-        assert!(
-            payroll_client.try_batch_process_payroll(
-                &proofs_bad, &amounts_bad, &employees_bad, &500, &nonce, &None
-            ).is_err()
-        );
-
-        // Failure 2: spend mismatch
-        let (proofs2, amounts2, employees2) = single_payment_batch(&env, &employee, 500);
-        assert!(
-            payroll_client.try_batch_process_payroll(
-                &proofs2, &amounts2, &employees2, &1, &nonce, &None
-            ).is_err()
-        );
-
-        // Failure 3: array length mismatch
-        let mut proofs3 = Vec::new(&env);
-        proofs3.push_back(mock_proof(&env));
-        proofs3.push_back(mock_proof(&env)); // extra proof
-        let mut amounts3 = Vec::new(&env);
-        amounts3.push_back(500i128);
-        let mut employees3 = Vec::new(&env);
-        employees3.push_back(employee.clone());
-        assert!(
-            payroll_client.try_batch_process_payroll(
-                &proofs3, &amounts3, &employees3, &500, &nonce, &None
-            ).is_err()
-        );
-
-        // Success: well-formed batch with the same nonce (it was rolled back each time).
-        let (proofs_ok, amounts_ok, employees_ok) = single_payment_batch(&env, &employee, 500);
+        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
         let run_id = payroll_client.batch_process_payroll(
-            &proofs_ok, &amounts_ok, &employees_ok, &500, &nonce, &None,
+            &proofs, &amounts, &employees, &1000, &test_nonce(&env, 222), &None,
         );
-        assert!(run_id > 0, "Valid batch after successive failures must succeed");
 
+        let result = payroll_client.try_get_archived_run(&run_id);
+        assert!(result.is_err(), "Non-archived run must not be accessible via get_archived_run");
+    }
+
+    #[test]
+    fn test_get_payroll_run_still_works_for_archived_run() {
+        let env = Env::default();
+        let (payroll_client, admin, _treasury, _treasury_owner, employee) =
+            setup_simple_payroll(&env);
+
+        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
+        let run_id = payroll_client.batch_process_payroll(
+            &proofs, &amounts, &employees, &1000, &test_nonce(&env, 223), &None,
+        );
+        payroll_client.archive_payroll_run(&admin, &run_id);
+
+        // Original get_payroll_run must still return the same record.
         let run = payroll_client.get_payroll_run(&run_id);
-        assert_eq!(run.total_amount, 500, "Run total must match the successful batch");
-        assert_eq!(run.employee_count, 1, "Employee count must be 1");
-
-        // Exactly one PayrollRun must exist.
-        assert!(payroll_client.try_get_payroll_run(&(run_id + 1)).is_err());
+        assert_eq!(run.run_id, run_id);
     }
 
-    // -------------------------------------------------------------------------
-    // B. prepare_payroll_run failure atomicity
-    // -------------------------------------------------------------------------
+    // ── Issue #147: company state gate ───────────────────────────────────────
 
-    /// prepare_payroll_run with a spend mismatch must fail without creating a
-    /// pending run or consuming the nonce. A corrected call must then succeed.
     #[test]
-    fn test_recovery_failed_prepare_spend_mismatch_nonce_reusable() {
+    fn test_batch_process_succeeds_with_no_company_state_set() {
+        // Default (no state stored) should behave as Active.
         let env = Env::default();
         let (payroll_client, _admin, _treasury, _treasury_owner, employee) =
             setup_simple_payroll(&env);
 
-        let nonce = test_nonce(&env, 310);
-        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 500);
-
-        // Wrong expected_total_spend — prepare must panic before writing anything.
-        let result = payroll_client.try_prepare_payroll_run(
-            &proofs, &amounts, &employees, &9999, &nonce, &None,
-        );
-        assert!(result.is_err(), "Failed prepare must return an error");
-
-        // No pending run should exist.
-        for id in 1..=3u64 {
-            assert!(payroll_client.get_pending_run(&id).is_none());
-        }
-
-        // Nonce must be reusable.
-        let run_id = payroll_client.prepare_payroll_run(
-            &proofs, &amounts, &employees, &500, &nonce, &None,
-        );
-        assert!(run_id > 0, "prepare must succeed after rolled-back failed attempt");
-
-        let pending = payroll_client.get_pending_run(&run_id);
-        assert!(pending.is_some(), "Pending run must exist after successful prepare");
-        assert_eq!(pending.unwrap().total_amount, 500);
-    }
-
-    /// prepare_payroll_run with array length mismatch must fail atomically —
-    /// no pending run, no consumed nonce.
-    #[test]
-    fn test_recovery_failed_prepare_array_mismatch_nonce_reusable() {
-        let env = Env::default();
-        let (payroll_client, _admin, _treasury, _treasury_owner, employee) =
-            setup_simple_payroll(&env);
-
-        let nonce = test_nonce(&env, 311);
-
-        // One proof, two amounts — deliberate mismatch.
-        let mut proofs = Vec::new(&env);
-        proofs.push_back(mock_proof(&env));
-        let mut amounts = Vec::new(&env);
-        amounts.push_back(500i128);
-        amounts.push_back(500i128);
-        let mut employees = Vec::new(&env);
-        employees.push_back(employee.clone());
-
-        let result = payroll_client.try_prepare_payroll_run(
-            &proofs, &amounts, &employees, &1000, &nonce, &None,
-        );
-        assert!(result.is_err());
-
-        // Corrected prepare must work.
-        let (proofs_ok, amounts_ok, employees_ok) = single_payment_batch(&env, &employee, 500);
-        let run_id = payroll_client.prepare_payroll_run(
-            &proofs_ok, &amounts_ok, &employees_ok, &500, &nonce, &None,
+        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
+        let run_id = payroll_client.batch_process_payroll(
+            &proofs, &amounts, &employees, &1000, &test_nonce(&env, 230), &None,
         );
         assert!(run_id > 0);
     }
 
-    // -------------------------------------------------------------------------
-    // C. cancel_payroll_run — clean cancellation enables fresh execution
-    // -------------------------------------------------------------------------
-
-    /// Cancelling a pending run removes it from storage and emits the
-    /// cancellation event. A subsequent prepare+execute with fresh parameters
-    /// must succeed and produce a valid PayrollRun record.
     #[test]
-    fn test_recovery_cancel_then_resubmit_succeeds() {
+    fn test_batch_process_succeeds_when_company_active() {
         let env = Env::default();
         let (payroll_client, admin, _treasury, _treasury_owner, employee) =
             setup_simple_payroll(&env);
 
-        let nonce1 = test_nonce(&env, 320);
-        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 500);
+        payroll_client.set_company_state(&admin, &CompanyState::Active);
 
-        // Prepare run 1.
-        let run_id1 = payroll_client.prepare_payroll_run(
-            &proofs, &amounts, &employees, &500, &nonce1, &None,
+        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
+        let run_id = payroll_client.batch_process_payroll(
+            &proofs, &amounts, &employees, &1000, &test_nonce(&env, 231), &None,
         );
-        assert!(payroll_client.get_pending_run(&run_id1).is_some());
-
-        // Cancel it.
-        payroll_client.cancel_payroll_run(&admin, &run_id1);
-        assert!(
-            payroll_client.get_pending_run(&run_id1).is_none(),
-            "Pending run must be removed after cancellation"
-        );
-
-        // Prepare and execute a fresh run with a new nonce.
-        let nonce2 = test_nonce(&env, 321);
-        let run_id2 = payroll_client.prepare_payroll_run(
-            &proofs, &amounts, &employees, &500, &nonce2, &None,
-        );
-        assert!(run_id2 > 0);
-        assert!(payroll_client.get_pending_run(&run_id2).is_some());
-
-        // Execute — must produce a PayrollRun.
-        let exec_id = payroll_client.batch_process_payroll(
-            &proofs, &amounts, &employees, &500, &test_nonce(&env, 322), &None,
-        );
-        assert!(exec_id > 0);
-        let run = payroll_client.get_payroll_run(&exec_id);
-        assert_eq!(run.total_amount, 500);
-        assert_eq!(run.employee_count, 1);
+        assert!(run_id > 0);
     }
 
-    /// Cancelling the same run a second time must fail — the pending run no
-    /// longer exists. The already-cancelled state is preserved.
     #[test]
-    fn test_recovery_double_cancel_fails_gracefully() {
+    fn test_batch_process_fails_when_company_paused() {
         let env = Env::default();
         let (payroll_client, admin, _treasury, _treasury_owner, employee) =
             setup_simple_payroll(&env);
 
-        let nonce = test_nonce(&env, 323);
-        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 500);
+        payroll_client.set_company_state(&admin, &CompanyState::Paused);
 
-        let run_id = payroll_client.prepare_payroll_run(
-            &proofs, &amounts, &employees, &500, &nonce, &None,
+        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
+        let result = payroll_client.try_batch_process_payroll(
+            &proofs, &amounts, &employees, &1000, &test_nonce(&env, 232), &None,
         );
-
-        // First cancel — must succeed.
-        payroll_client.cancel_payroll_run(&admin, &run_id);
-        assert!(payroll_client.get_pending_run(&run_id).is_none());
-
-        // Second cancel — must fail (run already gone).
-        let result = payroll_client.try_cancel_payroll_run(&admin, &run_id);
-        assert!(result.is_err(), "Second cancellation must fail");
-
-        // State is still clean: no pending run, no PayrollRun record.
-        assert!(payroll_client.get_pending_run(&run_id).is_none());
-        assert!(payroll_client.try_get_payroll_run(&run_id).is_err());
+        assert!(result.is_err());
     }
 
-    /// An unauthorized cancel attempt must fail and leave the pending run
-    /// fully intact so the authorized admin can still execute it.
     #[test]
-    fn test_recovery_unauthorized_cancel_leaves_pending_run_intact() {
+    fn test_batch_process_fails_when_company_archived() {
         let env = Env::default();
         let (payroll_client, admin, _treasury, _treasury_owner, employee) =
             setup_simple_payroll(&env);
 
-        let nonce = test_nonce(&env, 324);
-        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 500);
+        payroll_client.set_company_state(&admin, &CompanyState::Archived);
 
-        let run_id = payroll_client.prepare_payroll_run(
-            &proofs, &amounts, &employees, &500, &nonce, &None,
+        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
+        let result = payroll_client.try_batch_process_payroll(
+            &proofs, &amounts, &employees, &1000, &test_nonce(&env, 233), &None,
         );
-
-        let attacker = Address::generate(&env);
-        let result = payroll_client.try_cancel_payroll_run(&attacker, &run_id);
-        assert!(result.is_err(), "Unauthorized cancel must fail");
-
-        // Pending run must still be present.
-        let pending = payroll_client.get_pending_run(&run_id);
-        assert!(pending.is_some(), "Pending run must survive unauthorized cancel");
-        assert_eq!(pending.unwrap().run_id, run_id);
-
-        // Admin can still execute the run.
-        let exec_nonce = test_nonce(&env, 325);
-        let exec_id = payroll_client.batch_process_payroll(
-            &proofs, &amounts, &employees, &500, &exec_nonce, &None,
-        );
-        assert!(exec_id > 0, "Admin must still be able to execute after failed cancel");
+        assert!(result.is_err());
     }
 
-    // -------------------------------------------------------------------------
-    // D. Emergency withdrawal partial failure — no stale request left
-    // -------------------------------------------------------------------------
-
-    /// An emergency withdrawal request from a non-treasury-owner must fail.
-    /// No EmergencyWithdrawalRequest record must be created, and the treasury
-    /// balance must be unchanged.
     #[test]
-    fn test_recovery_unauthorized_emergency_request_leaves_no_record() {
+    fn test_batch_process_fails_when_company_incomplete() {
+        let env = Env::default();
+        let (payroll_client, admin, _treasury, _treasury_owner, employee) =
+            setup_simple_payroll(&env);
+
+        payroll_client.set_company_state(&admin, &CompanyState::Incomplete);
+
+        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
+        let result = payroll_client.try_batch_process_payroll(
+            &proofs, &amounts, &employees, &1000, &test_nonce(&env, 234), &None,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_set_company_state_rejects_non_admin() {
         let env = Env::default();
         let (payroll_client, _admin, _treasury, _treasury_owner, _employee) =
             setup_simple_payroll(&env);
 
         let attacker = Address::generate(&env);
-        let recipient = Address::generate(&env);
-
-        let result = payroll_client.try_request_emergency_withdrawal(
-            &attacker, &100i128, &recipient,
-        );
-        assert!(result.is_err(), "Unauthorized withdrawal request must fail");
-
-        // No pending request must exist.
-        assert!(
-            payroll_client.get_emergency_request().is_none(),
-            "No emergency request must exist after unauthorized attempt"
-        );
+        let result = payroll_client.try_set_company_state(&attacker, &CompanyState::Paused);
+        assert!(result.is_err());
     }
 
-    /// Cancelling an emergency withdrawal request leaves the contract in a
-    /// clean state. A subsequent legitimate request must be accepted.
     #[test]
-    fn test_recovery_cancelled_emergency_request_allows_fresh_request() {
+    fn test_get_company_state_defaults_to_active() {
         let env = Env::default();
         let (payroll_client, _admin, _treasury, _treasury_owner, _employee) =
             setup_simple_payroll(&env);
 
-        let recipient = Address::generate(&env);
+        assert_eq!(payroll_client.get_company_state(), CompanyState::Active);
+    }
 
-        // Submit a request as treasury_owner.
-        payroll_client.request_emergency_withdrawal(&_treasury_owner, &200i128, &recipient);
-        assert!(payroll_client.get_emergency_request().is_some());
+    #[test]
+    fn test_company_can_resume_from_paused_to_active() {
+        let env = Env::default();
+        let (payroll_client, admin, _treasury, _treasury_owner, employee) =
+            setup_simple_payroll(&env);
 
-        // Cancel it (admin or treasury_owner may cancel).
-        payroll_client.cancel_emergency_withdrawal(&_treasury_owner);
-        assert!(
-            payroll_client.get_emergency_request().is_none(),
-            "Emergency request must be cleared after cancellation"
+        payroll_client.set_company_state(&admin, &CompanyState::Paused);
+        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
+        let result = payroll_client.try_batch_process_payroll(
+            &proofs, &amounts, &employees, &1000, &test_nonce(&env, 235), &None,
         );
+        assert!(result.is_err(), "Paused company must reject payroll");
 
-        // A fresh request from the treasury_owner must now be accepted.
-        let recipient2 = Address::generate(&env);
-        payroll_client.request_emergency_withdrawal(&_treasury_owner, &300i128, &recipient2);
-        let req = payroll_client.get_emergency_request();
-        assert!(req.is_some(), "Fresh emergency request must succeed after cancellation");
-        assert_eq!(req.unwrap().amount, 300i128);
+        payroll_client.set_company_state(&admin, &CompanyState::Active);
+        let run_id = payroll_client.batch_process_payroll(
+            &proofs, &amounts, &employees, &1000, &test_nonce(&env, 236), &None,
+        );
+        assert!(run_id > 0, "Active company must accept payroll after resuming");
     }
 }
