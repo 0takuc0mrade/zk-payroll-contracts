@@ -4,6 +4,7 @@ extern crate alloc;
 use alloc::format;
 
 use pause_manager::PauseManagerClient;
+use payroll_events;
 use payroll_registry::{CompanyInfo, PayrollRegistryClient};
 use proof_verifier::{Groth16Proof, ProofVerifierClient};
 use salary_commitment::SalaryCommitmentContractClient;
@@ -161,6 +162,7 @@ impl PaymentExecutor {
         env.storage()
             .persistent()
             .set(&DataKey::ExecutorAdmin, &admin);
+        payroll_events::emit_executor_admin_set(&env, admin);
     }
 
     /// Set the pause manager contract address (only executor admin).
@@ -174,6 +176,7 @@ impl PaymentExecutor {
         env.storage()
             .persistent()
             .set(&DataKey::PauseManager, &pause_manager);
+        payroll_events::emit_executor_pause_manager_set(&env, pause_manager);
     }
 
     /// Allow or disallow an asset token for payment execution (only executor admin - issue #175).
@@ -256,10 +259,7 @@ impl PaymentExecutor {
         env.storage().persistent().set(&period_key, &period);
         env.storage().persistent().set(&seq_key, &(next_id + 1));
 
-        env.events().publish(
-            (soroban_sdk::Symbol::new(&env, "PeriodCreated"), company_id),
-            (next_id,),
-        );
+        payroll_events::emit_period_created(&env, company_id, next_id);
 
         Ok(period)
     }
@@ -296,10 +296,7 @@ impl PaymentExecutor {
         period.end_ledger = env.ledger().sequence();
         env.storage().persistent().set(&period_key, &period);
 
-        env.events().publish(
-            (soroban_sdk::Symbol::new(&env, "PeriodClosed"), company_id),
-            (period_id,),
-        );
+        payroll_events::emit_period_closed(&env, company_id, period_id);
 
         Ok(period)
     }
@@ -445,15 +442,7 @@ impl PaymentExecutor {
             .set(&total_key, &(current_total + amount));
 
         // Emit PayrollProcessed event so off-chain indexers can reconcile payments.
-        env.events().publish(
-            (
-                soroban_sdk::Symbol::new(&env, "PayrollProcessed"),
-                company_id,
-            ),
-            (employee, amount, period),
-        );
-        // topics : ("PayrollProcessed", company_id)
-        // data   : (employee, amount, period)
+        payroll_events::emit_executor_payment_processed(&env, company_id, employee, amount, period);
 
         let _ = nullifier;
 

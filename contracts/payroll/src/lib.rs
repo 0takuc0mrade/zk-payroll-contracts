@@ -1,8 +1,9 @@
 #![no_std]
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, token as soroban_token, Address, BytesN,
-    Env, Symbol, Vec,
+    contract, contractimpl, contracttype, token as soroban_token, Address, BytesN, Env, Symbol, Vec,
 };
+
+use payroll_events;
 
 use pause_manager::PauseManagerClient;
 use proof_verifier::ProofVerifierClient;
@@ -337,6 +338,16 @@ impl Payroll {
             .persistent()
             .set(&DataKey::TreasuryOwner, &treasury_owner);
         e.storage().persistent().set(&DataKey::RunCounter, &0u64);
+
+        payroll_events::emit_payroll_initialized(
+            &e,
+            addrs.admin.clone(),
+            addrs.token.clone(),
+            addrs.verifier.clone(),
+            addrs.commitment.clone(),
+            addrs.treasury.clone(),
+            treasury_owner.clone(),
+        );
     }
 
     fn require_not_paused(e: &Env) {
@@ -387,6 +398,8 @@ impl Payroll {
         e.storage()
             .persistent()
             .set(&DataKey::PauseManager, &pause_manager);
+
+        payroll_events::emit_pause_manager_set(&e, pause_manager);
     }
 
     pub fn deposit(e: Env, from: Address, amount: i128, deposit_id: BytesN<32>) {
@@ -636,10 +649,7 @@ impl Payroll {
         }
         e.storage().persistent().set(&key, &true);
 
-        e.events().publish(
-            (symbol_short!("payroll"), Symbol::new(&e, "meta_committed")),
-            metadata_hash,
-        );
+        payroll_events::emit_metadata_committed(&e, metadata_hash);
     }
 
     /// Bound a pre-committed metadata hash to an existing payroll run.
@@ -677,10 +687,7 @@ impl Payroll {
         run.metadata_hash = metadata_hash.clone();
         e.storage().persistent().set(&run_key, &run);
 
-        e.events().publish(
-            (symbol_short!("payroll"), Symbol::new(&e, "meta_bound")),
-            (run_id, metadata_hash),
-        );
+        payroll_events::emit_metadata_bound(&e, run_id, metadata_hash);
     }
 
     /// Pre-commit an off-chain draft hash so it can be bound to a future run.
@@ -711,10 +718,7 @@ impl Payroll {
         }
         e.storage().persistent().set(&key, &true);
 
-        e.events().publish(
-            (symbol_short!("payroll"), Symbol::new(&e, "draft_committed")),
-            draft_hash,
-        );
+        payroll_events::emit_draft_committed(&e, draft_hash);
     }
 
     /// Request an emergency treasury withdrawal (step 1 of 2 — issue #104).
@@ -757,10 +761,7 @@ impl Payroll {
             .persistent()
             .set(&DataKey::EmergencyRequest, &request);
 
-        e.events().publish(
-            (symbol_short!("payroll"), Symbol::new(&e, "emrg_requested")),
-            (amount, recipient),
-        );
+        payroll_events::emit_emergency_requested(&e, amount, recipient);
     }
 
     /// Approve and execute a pending emergency withdrawal (step 2 of 2 — issue #104).
@@ -792,10 +793,7 @@ impl Payroll {
         let token_client = soroban_token::Client::new(&e, &addrs.token);
         token_client.transfer(&addrs.treasury, &request.recipient, &request.amount);
 
-        e.events().publish(
-            (symbol_short!("payroll"), Symbol::new(&e, "emrg_approved")),
-            (request.amount, request.recipient),
-        );
+        payroll_events::emit_emergency_approved(&e, request.amount, request.recipient);
     }
 
     /// Cancel a pending emergency withdrawal request.
@@ -827,10 +825,7 @@ impl Payroll {
         }
         e.storage().persistent().remove(&DataKey::EmergencyRequest);
 
-        e.events().publish(
-            (symbol_short!("payroll"), Symbol::new(&e, "emrg_cancelled")),
-            caller,
-        );
+        payroll_events::emit_emergency_cancelled(&e, caller);
     }
 
     /// Returns the pending emergency withdrawal request, if any.
@@ -932,10 +927,7 @@ impl Payroll {
             .set(&DataKey::PendingRun(run_id), &pending_run);
         Self::record_payroll_run_state(&e, run_id, PayrollRunState::Submitted);
 
-        e.events().publish(
-            (symbol_short!("payroll"), Symbol::new(&e, "run_prepared")),
-            (run_id, expected_total_spend),
-        );
+        payroll_events::emit_run_prepared(&e, run_id, expected_total_spend);
 
         run_id
     }
@@ -1197,15 +1189,7 @@ impl Payroll {
             // altered after payroll has been executed for this period.
             commitment_client.lock_commitment_updates(&employee);
 
-            e.events().publish(
-                (
-                    symbol_short!("payroll"),
-                    Symbol::new(&e, "payment_executed"),
-                ),
-                (employee.clone(), amount),
-            );
-            // topics : ("payroll", "payment_executed")
-            // data   : (employee, amount)
+            payroll_events::emit_payment_executed(&e, employee.clone(), amount);
         }
 
         let run = PayrollRun {
@@ -1224,10 +1208,7 @@ impl Payroll {
             .set(&DataKey::PayrollRun(run_id), &run);
         Self::record_payroll_run_state(&e, run_id, PayrollRunState::ReconciliationRequired);
 
-        e.events().publish(
-            (symbol_short!("payroll"), Symbol::new(&e, "run_executed")),
-            (run_id, expected_total_spend),
-        );
+        payroll_events::emit_run_executed(&e, run_id, expected_total_spend);
 
         run_id
     }
@@ -1285,10 +1266,7 @@ impl Payroll {
             .persistent()
             .set(&DataKey::RunDraft(draft_id), &draft);
 
-        e.events().publish(
-            (symbol_short!("payroll"), Symbol::new(&e, "draft_created")),
-            (draft_id, admin, period_label),
-        );
+        payroll_events::emit_draft_created(&e, draft_id, admin, period_label);
 
         draft_id
     }
@@ -1433,9 +1411,11 @@ impl Payroll {
             .persistent()
             .set(&DataKey::RunDraft(draft_id), &draft);
 
-        e.events().publish(
-            (symbol_short!("payroll"), Symbol::new(&e, "draft_finalized")),
-            (draft_id, draft.total_amount, draft.amendment_count),
+        payroll_events::emit_draft_finalized(
+            &e,
+            draft_id,
+            draft.total_amount,
+            draft.amendment_count,
         );
     }
 
@@ -1478,10 +1458,7 @@ impl Payroll {
             .persistent()
             .set(&DataKey::PendingAdminRotation, &proposal);
 
-        e.events().publish(
-            (symbol_short!("payroll"), Symbol::new(&e, "admin_proposed")),
-            (current_admin, new_admin),
-        );
+        payroll_events::emit_admin_proposed(&e, current_admin, new_admin);
     }
 
     /// Accept an admin rotation proposal (step 2 of 2).
@@ -1514,10 +1491,7 @@ impl Payroll {
             .persistent()
             .remove(&DataKey::PendingAdminRotation);
 
-        e.events().publish(
-            (symbol_short!("payroll"), Symbol::new(&e, "admin_rotated")),
-            (old_admin, new_admin),
-        );
+        payroll_events::emit_admin_rotated(&e, old_admin, new_admin);
     }
 
     /// Cancel a pending admin rotation proposal.
@@ -1542,13 +1516,7 @@ impl Payroll {
             .persistent()
             .remove(&DataKey::PendingAdminRotation);
 
-        e.events().publish(
-            (
-                symbol_short!("payroll"),
-                Symbol::new(&e, "admin_rot_cancel"),
-            ),
-            current_admin,
-        );
+        payroll_events::emit_admin_rotation_cancelled(&e, current_admin);
     }
 
     /// Propose a new treasury owner (step 1 of 2).
@@ -1580,13 +1548,7 @@ impl Payroll {
             .persistent()
             .set(&DataKey::PendingTreasuryRotation, &proposal);
 
-        e.events().publish(
-            (
-                symbol_short!("payroll"),
-                Symbol::new(&e, "treasury_proposed"),
-            ),
-            (current_owner, new_owner),
-        );
+        payroll_events::emit_treasury_proposed(&e, current_owner, new_owner);
     }
 
     /// Accept a treasury-owner rotation (step 2 of 2).
@@ -1625,13 +1587,7 @@ impl Payroll {
             .persistent()
             .remove(&DataKey::PendingTreasuryRotation);
 
-        e.events().publish(
-            (
-                symbol_short!("payroll"),
-                Symbol::new(&e, "treasury_rotated"),
-            ),
-            (old_owner, new_owner),
-        );
+        payroll_events::emit_treasury_rotated(&e, old_owner, new_owner);
     }
 
     /// Cancel a pending treasury-owner rotation.
@@ -1658,13 +1614,7 @@ impl Payroll {
             .persistent()
             .remove(&DataKey::PendingTreasuryRotation);
 
-        e.events().publish(
-            (
-                symbol_short!("payroll"),
-                Symbol::new(&e, "treas_rot_cancel"),
-            ),
-            current_owner,
-        );
+        payroll_events::emit_treasury_rotation_cancelled(&e, current_owner);
     }
 
     /// Return the pending admin rotation proposal, if any.
@@ -3078,7 +3028,12 @@ mod tests {
 
         let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
         let run_id = payroll_client.batch_process_payroll(
-            &proofs, &amounts, &employees, &1000, &test_nonce(&env, 50), &None,
+            &proofs,
+            &amounts,
+            &employees,
+            &1000,
+            &test_nonce(&env, 50),
+            &None,
         );
         assert!(run_id > 0);
 
@@ -3099,7 +3054,12 @@ mod tests {
 
         let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
         let run_id = payroll_client.batch_process_payroll(
-            &proofs, &amounts, &employees, &1000, &test_nonce(&env, 51), &None,
+            &proofs,
+            &amounts,
+            &employees,
+            &1000,
+            &test_nonce(&env, 51),
+            &None,
         );
 
         let meta_hash = BytesN::from_array(&env, &[0xddu8; 32]);
@@ -3114,7 +3074,12 @@ mod tests {
 
         let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
         let run_id = payroll_client.batch_process_payroll(
-            &proofs, &amounts, &employees, &1000, &test_nonce(&env, 52), &None,
+            &proofs,
+            &amounts,
+            &employees,
+            &1000,
+            &test_nonce(&env, 52),
+            &None,
         );
 
         let run = payroll_client.get_payroll_run(&run_id);
@@ -3168,14 +3133,8 @@ mod tests {
 
         let nonce = test_nonce(&env, 45);
         let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
-        let run_id = payroll_client.prepare_payroll_run(
-            &proofs,
-            &amounts,
-            &employees,
-            &1000,
-            &nonce,
-            &None,
-        );
+        let run_id =
+            payroll_client.prepare_payroll_run(&proofs, &amounts, &employees, &1000, &nonce, &None);
 
         assert!(payroll_client.get_pending_run(&run_id).is_some());
         let reason = Symbol::new(&env, "test_cleanup");
@@ -3228,23 +3187,25 @@ mod tests {
         amounts.push_back(500i128);
 
         let nonce = test_nonce(&env, 100);
-        let result = payroll_client.try_batch_process_payroll(
-            &proofs,
-            &amounts,
-            &employees,
-            &1000,
-            &nonce,
-            &None,
-        );
+        let result = payroll_client
+            .try_batch_process_payroll(&proofs, &amounts, &employees, &1000, &nonce, &None);
         // Execution fails because emp2 has no stored commitment
         assert!(result.is_err());
 
         // Verify the nonce was rolled back — should be usable in a new run
         let (proofs2, amounts2, employees2) = single_payment_batch(&env, &emp1, 500);
         let run_id = payroll_client.batch_process_payroll(
-            &proofs2, &amounts2, &employees2, &500, &nonce, &None,
+            &proofs2,
+            &amounts2,
+            &employees2,
+            &500,
+            &nonce,
+            &None,
         );
-        assert!(run_id > 0, "Nonce must be reusable after rolled-back execution");
+        assert!(
+            run_id > 0,
+            "Nonce must be reusable after rolled-back execution"
+        );
     }
 
     #[test]
@@ -3276,7 +3237,12 @@ mod tests {
         // Mint only 100 tokens — NOT enough for the 1000 payment
         token_client.mint(&treasury, &100i128);
         payroll_client.initialize(
-            &admin, &token_id, &verifier_id, &commitment_id, &treasury, &treasury_owner,
+            &admin,
+            &token_id,
+            &verifier_id,
+            &commitment_id,
+            &treasury,
+            &treasury_owner,
         );
         commitment_client.set_payroll_operator(&payroll_id);
 
@@ -3291,7 +3257,12 @@ mod tests {
         payroll_client.commit_draft(&admin, &draft_hash);
 
         let result = payroll_client.try_batch_process_payroll(
-            &proofs, &amounts, &employees, &1000, &nonce, &Some(draft_hash.clone()),
+            &proofs,
+            &amounts,
+            &employees,
+            &1000,
+            &nonce,
+            &Some(draft_hash.clone()),
         );
         // Must fail due to insufficient treasury balance
         assert!(result.is_err());
@@ -3299,9 +3270,17 @@ mod tests {
         // Verify nonce is reusable (rolled back)
         token_client.mint(&treasury, &10_000i128);
         let run_id = payroll_client.batch_process_payroll(
-            &proofs, &amounts, &employees, &1000, &nonce, &Some(draft_hash.clone()),
+            &proofs,
+            &amounts,
+            &employees,
+            &1000,
+            &nonce,
+            &Some(draft_hash.clone()),
         );
-        assert!(run_id > 0, "Nonce and commitment must be reusable after failed execution");
+        assert!(
+            run_id > 0,
+            "Nonce and commitment must be reusable after failed execution"
+        );
     }
 
     #[test]
@@ -3314,9 +3293,8 @@ mod tests {
         let nonce = test_nonce(&env, 102);
         let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 500);
 
-        let result = payroll_client.try_batch_process_payroll(
-            &proofs, &amounts, &employees, &999, &nonce, &None,
-        );
+        let result = payroll_client
+            .try_batch_process_payroll(&proofs, &amounts, &employees, &999, &nonce, &None);
         assert!(result.is_err());
 
         // Verify no payroll run record was created
@@ -3327,12 +3305,14 @@ mod tests {
                 break;
             }
         }
-        assert!(!any_run, "No PayrollRun should exist after a failed execution");
+        assert!(
+            !any_run,
+            "No PayrollRun should exist after a failed execution"
+        );
 
         // Nonce is NOT consumed (rolled back) — can retry with corrected params
-        let run_id = payroll_client.batch_process_payroll(
-            &proofs, &amounts, &employees, &500, &nonce, &None,
-        );
+        let run_id = payroll_client
+            .batch_process_payroll(&proofs, &amounts, &employees, &500, &nonce, &None);
         assert!(run_id > 0, "Nonce must be reusable after failed execution");
     }
 
@@ -3349,16 +3329,29 @@ mod tests {
         let nonce = test_nonce(&env, 103);
         let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 500);
         let result = payroll_client.try_batch_process_payroll(
-            &proofs, &amounts, &employees, &999, &nonce, &Some(draft_hash.clone()),
+            &proofs,
+            &amounts,
+            &employees,
+            &999,
+            &nonce,
+            &Some(draft_hash.clone()),
         );
         assert!(result.is_err());
 
         // Draft commitment should still be usable (rolled back)
         let nonce2 = test_nonce(&env, 104);
         let run_id = payroll_client.batch_process_payroll(
-            &proofs, &amounts, &employees, &500, &nonce2, &Some(draft_hash),
+            &proofs,
+            &amounts,
+            &employees,
+            &500,
+            &nonce2,
+            &Some(draft_hash),
         );
-        assert!(run_id > 0, "Draft commitment must survive a rolled-back execution");
+        assert!(
+            run_id > 0,
+            "Draft commitment must survive a rolled-back execution"
+        );
     }
 
     #[test]
@@ -3369,16 +3362,14 @@ mod tests {
 
         let nonce = test_nonce(&env, 105);
         let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 500);
-        let result = payroll_client.try_batch_process_payroll(
-            &proofs, &amounts, &employees, &999, &nonce, &None,
-        );
+        let result = payroll_client
+            .try_batch_process_payroll(&proofs, &amounts, &employees, &999, &nonce, &None);
         assert!(result.is_err());
 
         // After failure, a successful run with the same nonce should work
         // (nonce was rolled back). Also verify the run gets a valid ID.
-        let run_id = payroll_client.batch_process_payroll(
-            &proofs, &amounts, &employees, &500, &nonce, &None,
-        );
+        let run_id = payroll_client
+            .batch_process_payroll(&proofs, &amounts, &employees, &500, &nonce, &None);
         assert!(run_id > 0, "Nonce must be reusable after failed execution");
     }
 
@@ -3391,15 +3382,11 @@ mod tests {
 
         let nonce = test_nonce(&env, 106);
         let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 500);
-        payroll_client.batch_process_payroll(
-            &proofs, &amounts, &employees, &500, &nonce, &None,
-        );
+        payroll_client.batch_process_payroll(&proofs, &amounts, &employees, &500, &nonce, &None);
 
         // Second attempt with same nonce — must fail permanently
         let (proofs2, amounts2, employees2) = single_payment_batch(&env, &employee, 500);
-        payroll_client.batch_process_payroll(
-            &proofs2, &amounts2, &employees2, &500, &nonce, &None,
-        );
+        payroll_client.batch_process_payroll(&proofs2, &amounts2, &employees2, &500, &nonce, &None);
     }
 
     #[test]
@@ -3417,9 +3404,8 @@ mod tests {
         employees.push_back(employee.clone());
 
         // Successful prepare
-        let run_id = payroll_client.prepare_payroll_run(
-            &proofs, &amounts, &employees, &500, &nonce, &None,
-        );
+        let run_id =
+            payroll_client.prepare_payroll_run(&proofs, &amounts, &employees, &500, &nonce, &None);
         assert!(run_id > 0);
 
         // Failed cancel (wrong caller) should not affect the pending run
@@ -3430,7 +3416,10 @@ mod tests {
 
         // Pending run should still exist
         let pending = payroll_client.get_pending_run(&run_id);
-        assert!(pending.is_some(), "Pending run must survive unauthorized cancel attempt");
+        assert!(
+            pending.is_some(),
+            "Pending run must survive unauthorized cancel attempt"
+        );
     }
 
     #[test]
@@ -3448,17 +3437,24 @@ mod tests {
         let mut employees = Vec::new(&env);
         employees.push_back(employee.clone());
 
-        let result = payroll_client.try_batch_process_payroll(
-            &proofs, &amounts, &employees, &1000, &nonce, &None,
-        );
+        let result = payroll_client
+            .try_batch_process_payroll(&proofs, &amounts, &employees, &1000, &nonce, &None);
         assert!(result.is_err());
 
         // Nonce should still be usable after rollback
         let (proofs2, amounts2, employees2) = single_payment_batch(&env, &employee, 500);
         let run_id = payroll_client.batch_process_payroll(
-            &proofs2, &amounts2, &employees2, &500, &nonce, &None,
+            &proofs2,
+            &amounts2,
+            &employees2,
+            &500,
+            &nonce,
+            &None,
         );
-        assert!(run_id > 0, "Nonce must be reusable after array mismatch rollback");
+        assert!(
+            run_id > 0,
+            "Nonce must be reusable after array mismatch rollback"
+        );
     }
 
     #[test]
@@ -3528,7 +3524,12 @@ mod tests {
         let mut amounts = Vec::new(&env);
         amounts.push_back(0i128);
         payroll_client.batch_process_payroll(
-            &proofs, &amounts, &employees, &0, &test_nonce(&env, 200), &None,
+            &proofs,
+            &amounts,
+            &employees,
+            &0,
+            &test_nonce(&env, 200),
+            &None,
         );
     }
 
@@ -3543,7 +3544,12 @@ mod tests {
         let mut amounts = Vec::new(&env);
         amounts.push_back(-1i128);
         payroll_client.batch_process_payroll(
-            &proofs, &amounts, &employees, &-1, &test_nonce(&env, 201), &None,
+            &proofs,
+            &amounts,
+            &employees,
+            &-1,
+            &test_nonce(&env, 201),
+            &None,
         );
     }
 
@@ -3558,7 +3564,12 @@ mod tests {
         let mut amounts = Vec::new(&env);
         amounts.push_back(0i128);
         payroll_client.prepare_payroll_run(
-            &proofs, &amounts, &employees, &0, &test_nonce(&env, 202), &None,
+            &proofs,
+            &amounts,
+            &employees,
+            &0,
+            &test_nonce(&env, 202),
+            &None,
         );
     }
 
@@ -3573,7 +3584,12 @@ mod tests {
         let mut amounts = Vec::new(&env);
         amounts.push_back(-1i128);
         payroll_client.prepare_payroll_run(
-            &proofs, &amounts, &employees, &-1, &test_nonce(&env, 203), &None,
+            &proofs,
+            &amounts,
+            &employees,
+            &-1,
+            &test_nonce(&env, 203),
+            &None,
         );
     }
 
@@ -3587,15 +3603,16 @@ mod tests {
 
         let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
         let run_id = payroll_client.batch_process_payroll(
-            &proofs, &amounts, &employees, &1000, &test_nonce(&env, 210), &None,
+            &proofs,
+            &amounts,
+            &employees,
+            &1000,
+            &test_nonce(&env, 210),
+            &None,
         );
 
-        let draft_id = payroll_client.create_run_draft(
-            &admin,
-            &5_000i128,
-            &10u32,
-            &Symbol::new(&env, "Q1"),
-        );
+        let draft_id =
+            payroll_client.create_run_draft(&admin, &5_000i128, &10u32, &Symbol::new(&env, "Q1"));
 
         let run = payroll_client.get_payroll_run(&run_id);
         let draft = payroll_client.get_run_draft(&draft_id);
@@ -3612,7 +3629,12 @@ mod tests {
 
         let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
         let run_id = payroll_client.batch_process_payroll(
-            &proofs, &amounts, &employees, &1000, &test_nonce(&env, 211), &None,
+            &proofs,
+            &amounts,
+            &employees,
+            &1000,
+            &test_nonce(&env, 211),
+            &None,
         );
 
         let run = payroll_client.get_payroll_run(&run_id);
@@ -3629,12 +3651,8 @@ mod tests {
         let (payroll_client, admin, _treasury, _treasury_owner, _employee) =
             setup_simple_payroll(&env);
 
-        let id = payroll_client.create_run_draft(
-            &admin,
-            &8_000i128,
-            &15u32,
-            &Symbol::new(&env, "MAR"),
-        );
+        let id =
+            payroll_client.create_run_draft(&admin, &8_000i128, &15u32, &Symbol::new(&env, "MAR"));
 
         payroll_client.finalize_run_draft(&admin, &id);
         let draft = payroll_client.get_run_draft(&id);
@@ -3653,14 +3671,12 @@ mod tests {
         let nonce = test_nonce(&env, 212);
         let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
 
-        let run_id = payroll_client.batch_process_payroll(
-            &proofs, &amounts, &employees, &1000, &nonce, &None,
-        );
+        let run_id = payroll_client
+            .batch_process_payroll(&proofs, &amounts, &employees, &1000, &nonce, &None);
         assert!(run_id > 0);
 
-        let result = payroll_client.try_batch_process_payroll(
-            &proofs, &amounts, &employees, &1000, &nonce, &None,
-        );
+        let result = payroll_client
+            .try_batch_process_payroll(&proofs, &amounts, &employees, &1000, &nonce, &None);
         assert!(result.is_err());
     }
 
@@ -3693,12 +3709,8 @@ mod tests {
         let (payroll_client, admin, _treasury, _treasury_owner, _employee) =
             setup_simple_payroll(&env);
 
-        let draft_id = payroll_client.create_run_draft(
-            &admin,
-            &10_000i128,
-            &20u32,
-            &Symbol::new(&env, "Q4"),
-        );
+        let draft_id =
+            payroll_client.create_run_draft(&admin, &10_000i128, &20u32, &Symbol::new(&env, "Q4"));
 
         let draft = payroll_client.get_run_draft(&draft_id);
         assert_eq!(draft.state, RunDraftState::Pending);

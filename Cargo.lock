@@ -231,6 +231,7 @@ name = "audit_module"
 version = "0.1.0"
 dependencies = [
  "pause_manager",
+ "payroll_events",
  "soroban-sdk",
 ]
 
@@ -1789,6 +1790,7 @@ checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 name = "pause_manager"
 version = "0.1.0"
 dependencies = [
+ "payroll_events",
  "soroban-sdk",
 ]
 
@@ -1797,6 +1799,7 @@ name = "payment_executor"
 version = "0.1.0"
 dependencies = [
  "pause_manager",
+ "payroll_events",
  "payroll_registry",
  "proof_verifier",
  "salary_commitment",
@@ -1818,10 +1821,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "payroll_events"
+version = "0.1.0"
+dependencies = [
+ "soroban-sdk",
+]
+
+[[package]]
 name = "payroll_registry"
 version = "0.1.0"
 dependencies = [
  "pause_manager",
+ "payroll_events",
  "soroban-sdk",
 ]
 
@@ -2161,6 +2172,7 @@ name = "salary_commitment"
 version = "0.1.0"
 dependencies = [
  "pause_manager",
+ "payroll_events",
  "soroban-sdk",
 ]
 

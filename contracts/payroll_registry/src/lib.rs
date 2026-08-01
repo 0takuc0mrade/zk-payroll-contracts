@@ -191,6 +191,7 @@ impl PayrollRegistry {
         env.storage()
             .persistent()
             .set(&DataKey::PauseManager, &pause_manager);
+        payroll_events::emit_registry_pause_manager_set(&env, pause_manager);
     }
 
     fn add_employee_record(env: Env, company_id: u64, employee: Address, commitment: BytesN<32>) {
@@ -342,12 +343,7 @@ impl PayrollRegistryTrait for PayrollRegistry {
             .persistent()
             .set(&DataKey::CompanyAdmin(admin.clone()), &id);
 
-        env.events().publish(
-            (Symbol::new(&env, "CompanyRegistered"), id),
-            (admin, treasury),
-        );
-        // topics : ("CompanyRegistered", company_id)
-        // data   : (admin, treasury)
+        payroll_events::emit_company_registered(&env, id, admin, treasury);
 
         id
     }
@@ -386,12 +382,7 @@ impl PayrollRegistryTrait for PayrollRegistry {
             .persistent()
             .remove(&DataKey::Employee(company_id, emp));
 
-        env.events().publish(
-            (Symbol::new(&env, "EmployeeRemoved"), company_id, employee),
-            (),
-        );
-        // topics : ("EmployeeRemoved", company_id, employee)
-        // data   : ()
+        payroll_events::emit_employee_removed(&env, company_id, employee);
     }
 
     fn update_commitment(env: Env, company_id: u64, employee: Address, new_commitment: BytesN<32>) {
@@ -412,12 +403,12 @@ impl PayrollRegistryTrait for PayrollRegistry {
 
         env.storage().persistent().set(&key, &new_commitment);
 
-        env.events().publish(
-            (Symbol::new(&env, "CommitmentUpdated"), company_id, employee),
-            (new_commitment,),
+        payroll_events::emit_registry_commitment_updated(
+            &env,
+            company_id,
+            employee,
+            new_commitment,
         );
-        // topics : ("CommitmentUpdated", company_id, employee)
-        // data   : (new_commitment,)
     }
 
     fn get_company(env: Env, company_id: u64) -> CompanyInfo {
@@ -536,13 +527,14 @@ impl PayrollRegistryTrait for PayrollRegistry {
         }
 
         let proposal = PendingCompanyRotation {
-            new_holder: new_admin,
-            proposed_by: current_admin,
+            new_holder: new_admin.clone(),
+            proposed_by: current_admin.clone(),
             proposed_at: env.ledger().timestamp(),
         };
         env.storage()
             .persistent()
             .set(&DataKey::PendingAdminRotation(company_id), &proposal);
+        payroll_events::emit_company_admin_proposed(&env, company_id, current_admin, new_admin);
     }
 
     fn accept_admin_rotation(env: Env, company_id: u64, new_admin: Address) {
@@ -575,10 +567,11 @@ impl PayrollRegistryTrait for PayrollRegistry {
             .remove(&DataKey::PendingAdminRotation(company_id));
         env.storage()
             .persistent()
-            .remove(&DataKey::CompanyAdmin(old_admin));
+            .remove(&DataKey::CompanyAdmin(old_admin.clone()));
         env.storage()
             .persistent()
-            .set(&DataKey::CompanyAdmin(new_admin), &company_id);
+            .set(&DataKey::CompanyAdmin(new_admin.clone()), &company_id);
+        payroll_events::emit_company_admin_rotated(&env, company_id, old_admin, new_admin);
     }
 
     fn cancel_admin_rotation(env: Env, company_id: u64, current_admin: Address) {
@@ -603,6 +596,7 @@ impl PayrollRegistryTrait for PayrollRegistry {
         env.storage()
             .persistent()
             .remove(&DataKey::PendingAdminRotation(company_id));
+        payroll_events::emit_company_admin_rotation_cancelled(&env, company_id, current_admin);
     }
 
     fn propose_treasury_rotation(
