@@ -30,6 +30,8 @@ pub enum AuditError {
     CommitmentMismatch = 6,
     /// Supplied key material does not belong to the auditor.
     InvalidViewKey = 7,
+    /// The requested new expiration is not later than the current one.
+    ExpirationNotExtended = 8,
 }
 
 // ---------------------------------------------------------------------------
@@ -230,6 +232,83 @@ impl AuditModule {
             .ok_or(AuditError::KeyNotFound)
     }
 
+    /// Return the ledger sequence at which `auditor`'s current view key
+    /// expires, or `AuditError::KeyNotFound` if no key is stored.
+    ///
+    /// This is a read-only helper for off-chain tooling and cross-contract
+    /// callers that need to determine whether a key needs renewal without
+    /// performing a full audit operation.
+    pub fn get_expiration(env: Env, auditor: Address) -> Result<u32, AuditError> {
+        let record: ViewKeyRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AuditorKey(auditor))
+            .ok_or(AuditError::KeyNotFound)?;
+        Ok(record.expiration_ledger)
+    }
+
+    /// Extend an existing auditor view key to a new `new_expiration_ledger`.
+    ///
+    /// Only the address recorded as `granted_by` on the key may refresh it.
+    /// The new expiration must be strictly later than the current one to
+    /// prevent accidental truncation of an active grant.
+    ///
+    /// A fresh `key_bytes` value is derived for the new expiration so the key
+    /// material rotates on every refresh, preserving forward secrecy.
+    ///
+    /// Emits a `ViewKeyRefreshed` event on success:
+    ///   topics : ("ViewKeyRefreshed", admin, auditor)
+    ///   data   : (new_expiration_ledger,)
+    pub fn refresh_view_key(
+        env: Env,
+        admin: Address,
+        auditor: Address,
+        new_expiration_ledger: u32,
+    ) -> Result<BytesN<32>, AuditError> {
+        Self::require_not_paused(&env);
+        admin.require_auth();
+
+        let record: ViewKeyRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AuditorKey(auditor.clone()))
+            .ok_or(AuditError::KeyNotFound)?;
+
+        if record.granted_by != admin {
+            return Err(AuditError::NotKeyGranter);
+        }
+
+        // Guard against accidentally shortening an active key.
+        if new_expiration_ledger <= record.expiration_ledger {
+            return Err(AuditError::ExpirationNotExtended);
+        }
+
+        let new_key_bytes = Self::derive_key_bytes(&env, &auditor, new_expiration_ledger);
+
+        let updated = ViewKeyRecord {
+            key_bytes: new_key_bytes.clone(),
+            expiration_ledger: new_expiration_ledger,
+            granted_by: admin.clone(),
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::AuditorKey(auditor.clone()), &updated);
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "ViewKeyRefreshed"),
+                admin,
+                auditor,
+            ),
+            (new_expiration_ledger,),
+        );
+        // topics : ("ViewKeyRefreshed", admin, auditor)
+        // data   : (new_expiration_ledger,)
+
+        Ok(new_key_bytes)
+    }
+
     // -----------------------------------------------------------------------
     // Audit operations
     // -----------------------------------------------------------------------
@@ -313,10 +392,18 @@ impl AuditModule {
         let record: ViewKeyRecord = env
             .storage()
             .persistent()
-            .get(&DataKey::AuditorKey(auditor))
+            .get(&DataKey::AuditorKey(auditor.clone()))
             .ok_or(AuditError::KeyNotFound)?;
 
         if env.ledger().sequence() > record.expiration_ledger {
+            // Emit an observable event so off-chain monitors can detect the
+            // expiry boundary crossing and trigger re-issuance workflows.
+            env.events().publish(
+                (Symbol::new(env, "AuditAccessExpired"), auditor),
+                (record.expiration_ledger, env.ledger().sequence()),
+            );
+            // topics : ("AuditAccessExpired", auditor)
+            // data   : (expiration_ledger, current_sequence)
             return Err(AuditError::KeyExpired);
         }
 
