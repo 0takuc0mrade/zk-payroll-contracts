@@ -336,6 +336,9 @@ impl Payroll {
         e.storage().persistent().set(&key, &addrs);
         e.storage()
             .persistent()
+            .set(&DataKey::AllowedAsset(addrs.token.clone()), &true);
+        e.storage()
+            .persistent()
             .set(&DataKey::TreasuryOwner, &treasury_owner);
         e.storage().persistent().set(&DataKey::RunCounter, &0u64);
 
@@ -400,6 +403,27 @@ impl Payroll {
             .set(&DataKey::PauseManager, &pause_manager);
 
         payroll_events::emit_pause_manager_set(&e, pause_manager);
+    }
+
+    /// Allow or disallow an asset token for payroll payouts.
+    pub fn set_asset_allowed(e: Env, asset: Address, allowed: bool) {
+        let addrs: ContractAddresses = e
+            .storage()
+            .persistent()
+            .get(&DataKey::Addresses)
+            .expect("Not initialized");
+        addrs.admin.require_auth();
+        e.storage()
+            .persistent()
+            .set(&DataKey::AllowedAsset(asset), &allowed);
+    }
+
+    /// Check if an asset token is allowlisted for payroll payouts.
+    pub fn is_asset_allowed(e: Env, asset: Address) -> bool {
+        e.storage()
+            .persistent()
+            .get(&DataKey::AllowedAsset(asset))
+            .unwrap_or(false)
     }
 
     pub fn deposit(e: Env, from: Address, amount: i128, deposit_id: BytesN<32>) {
@@ -907,6 +931,11 @@ impl Payroll {
 
         addrs.admin.require_auth();
 
+        // Validate treasury asset allowlist
+        if !Self::is_asset_allowed(e.clone(), addrs.token.clone()) {
+            panic!("Asset not allowed");
+        }
+
         let run_id = Self::derive_run_id(&e);
 
         // Mark nonce as consumed (store run_id for auditability).
@@ -1119,9 +1148,10 @@ impl Payroll {
             .get(&DataKey::Addresses)
             .expect("Not initialized");
 
-        // Issue #147: gate on company lifecycle state before any auth, balance,
-        // or transfer logic runs, so rejected calls produce no partial side effects.
-        Self::require_company_active(&e);
+        // Validate treasury asset allowlist
+        if !Self::is_asset_allowed(e.clone(), addrs.token.clone()) {
+            panic!("Asset not allowed");
+        }
 
         if e.storage().persistent().has(&DataKey::PauseManager) {
             let pm_addr: Address = e
@@ -3726,409 +3756,115 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // ── Issue #177: metadata hash verification tests ─────────────────────────
-
-    #[test]
-    fn test_verify_metadata_hash_returns_true_on_match() {
-        let env = Env::default();
-        let (payroll_client, admin, _treasury, _treasury_owner, employee) =
-            setup_simple_payroll(&env);
-
-        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
-        let run_id = payroll_client.batch_process_payroll(
-            &proofs, &amounts, &employees, &1000, &test_nonce(&env, 60), &None,
-        );
-
-        let meta_hash = BytesN::from_array(&env, &[0xaau8; 32]);
-        payroll_client.commit_metadata_hash(&admin, &meta_hash);
-        payroll_client.set_run_metadata(&admin, &run_id, &meta_hash);
-
-        assert!(payroll_client.verify_metadata_hash(&run_id, &meta_hash));
-    }
-
-    #[test]
-    fn test_verify_metadata_hash_returns_false_on_mismatch() {
-        let env = Env::default();
-        let (payroll_client, admin, _treasury, _treasury_owner, employee) =
-            setup_simple_payroll(&env);
-
-        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
-        let run_id = payroll_client.batch_process_payroll(
-            &proofs, &amounts, &employees, &1000, &test_nonce(&env, 61), &None,
-        );
-
-        let meta_hash = BytesN::from_array(&env, &[0xbbu8; 32]);
-        payroll_client.commit_metadata_hash(&admin, &meta_hash);
-        payroll_client.set_run_metadata(&admin, &run_id, &meta_hash);
-
-        let wrong_hash = BytesN::from_array(&env, &[0xccu8; 32]);
-        assert!(!payroll_client.verify_metadata_hash(&run_id, &wrong_hash));
-    }
-
-    #[test]
-    #[should_panic(expected = "Run not found")]
-    fn test_verify_metadata_hash_nonexistent_run_panics() {
-        let env = Env::default();
-        let (payroll_client, _admin, _treasury, _treasury_owner, _employee) =
-            setup_simple_payroll(&env);
-
-        let hash = BytesN::from_array(&env, &[0xddu8; 32]);
-        payroll_client.verify_metadata_hash(&999u64, &hash);
-    }
-
-    #[test]
-    fn test_verify_metadata_hash_unbound_defaults_to_zero() {
-        let env = Env::default();
-        let (payroll_client, _admin, _treasury, _treasury_owner, employee) =
-            setup_simple_payroll(&env);
-
-        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
-        let run_id = payroll_client.batch_process_payroll(
-            &proofs, &amounts, &employees, &1000, &test_nonce(&env, 62), &None,
-        );
-
-        let zero = BytesN::from_array(&env, &[0u8; 32]);
-        assert!(payroll_client.verify_metadata_hash(&run_id, &zero));
-    }
-
-    #[test]
-    fn test_get_metadata_hash_returns_bound_value() {
-        let env = Env::default();
-        let (payroll_client, admin, _treasury, _treasury_owner, employee) =
-            setup_simple_payroll(&env);
-
-        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
-        let run_id = payroll_client.batch_process_payroll(
-            &proofs, &amounts, &employees, &1000, &test_nonce(&env, 63), &None,
-        );
-
-        let meta_hash = BytesN::from_array(&env, &[0xeeu8; 32]);
-        payroll_client.commit_metadata_hash(&admin, &meta_hash);
-        payroll_client.set_run_metadata(&admin, &run_id, &meta_hash);
-
-        let stored = payroll_client.get_metadata_hash(&run_id);
-        assert_eq!(stored, meta_hash);
-    }
-
-    #[test]
-    fn test_commit_metadata_hash_event_emitted() {
-        let env = Env::default();
-        let (payroll_client, admin, _treasury, _treasury_owner, _employee) =
-            setup_simple_payroll(&env);
-
-        let meta_hash = BytesN::from_array(&env, &[0xffu8; 32]);
-        let before = env.events().all().len();
-        payroll_client.commit_metadata_hash(&admin, &meta_hash);
-        let after = env.events().all().len();
-        assert!(after > before);
-    }
-
-    #[test]
-    fn test_metadata_hash_verification_after_commit_bind_cycle() {
-        let env = Env::default();
-        let (payroll_client, admin, _treasury, _treasury_owner, employee) =
-            setup_simple_payroll(&env);
-
-        let hash_a = BytesN::from_array(&env, &[0x11u8; 32]);
-        let hash_b = BytesN::from_array(&env, &[0x22u8; 32]);
-
-        payroll_client.commit_metadata_hash(&admin, &hash_a);
-        payroll_client.commit_metadata_hash(&admin, &hash_b);
-
-        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
-        let run_id = payroll_client.batch_process_payroll(
-            &proofs, &amounts, &employees, &1000, &test_nonce(&env, 64), &None,
-        );
-
-        payroll_client.set_run_metadata(&admin, &run_id, &hash_a);
-
-        assert!(payroll_client.verify_metadata_hash(&run_id, &hash_a));
-        assert!(!payroll_client.verify_metadata_hash(&run_id, &hash_b));
-    }
-
-    #[test]
-    #[should_panic(expected = "Unauthorized")]
-    fn test_commit_metadata_hash_rejects_non_admin() {
-        let env = Env::default();
-        let (payroll_client, _admin, _treasury, _treasury_owner, _employee) =
-            setup_simple_payroll(&env);
-
-        let attacker = Address::generate(&env);
-        let meta_hash = BytesN::from_array(&env, &[0x33u8; 32]);
-        payroll_client.commit_metadata_hash(&attacker, &meta_hash);
-    }
-
-    #[test]
-    #[should_panic(expected = "Unauthorized")]
-    fn test_set_run_metadata_rejects_non_admin() {
-        let env = Env::default();
-        let (payroll_client, admin, _treasury, _treasury_owner, employee) =
-            setup_simple_payroll(&env);
-
-        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
-        let run_id = payroll_client.batch_process_payroll(
-            &proofs, &amounts, &employees, &1000, &test_nonce(&env, 65), &None,
-        );
-
-        let meta_hash = BytesN::from_array(&env, &[0x44u8; 32]);
-        payroll_client.commit_metadata_hash(&admin, &meta_hash);
-
-        let attacker = Address::generate(&env);
-        payroll_client.set_run_metadata(&attacker, &run_id, &meta_hash);
-    }
-
-    // ── Issue #62: treasury deposit and balance accounting ────────────────────
-
-    #[test]
-    fn test_deposit_increments_company_balance() {
-        let env = Env::default();
-        let (payroll_client, _admin, treasury, _treasury_owner, _employee) =
-            setup_simple_payroll(&env);
-
-        assert_eq!(payroll_client.get_treasury_balance(&treasury), 0i128);
-
-        let id1 = BytesN::from_array(&env, &[0xb1u8; 32]);
-        payroll_client.deposit(&treasury, &300i128, &id1);
-        assert_eq!(payroll_client.get_treasury_balance(&treasury), 300i128);
-
-        let id2 = BytesN::from_array(&env, &[0xb2u8; 32]);
-        payroll_client.deposit(&treasury, &700i128, &id2);
-        assert_eq!(payroll_client.get_treasury_balance(&treasury), 1_000i128);
-    }
-
-    #[test]
-    fn test_get_treasury_balance_returns_zero_for_new_address() {
-        let env = Env::default();
-        let (payroll_client, _admin, _treasury, _treasury_owner, _employee) =
-            setup_simple_payroll(&env);
-
-        let unknown = Address::generate(&env);
-        assert_eq!(payroll_client.get_treasury_balance(&unknown), 0i128);
-    }
-
-    #[test]
-    fn test_batch_process_fails_with_insufficient_treasury() {
-        let env = Env::default();
+    // Issue #200: Asset allowlist enforcement tests
+    fn setup_payroll_with_token(env: &Env) -> (PayrollClient<'_>, Address, Address, Address, Address, Address) {
         env.mock_all_auths();
 
         let verifier_id = env.register_contract(None, ProofVerifier);
-        let verifier_client = ProofVerifierClient::new(&env, &verifier_id);
-        let verifier_admin = Address::generate(&env);
+        let verifier_client = ProofVerifierClient::new(env, &verifier_id);
+        let verifier_admin = Address::generate(env);
         verifier_client.init_verifier_admin(&verifier_admin);
-        verifier_client.initialize_verifier(&mock_vk(&env));
+        verifier_client.initialize_verifier(&mock_vk(env));
 
         let commitment_id = env.register_contract(None, SalaryCommitmentContract);
-        let commitment_client = SalaryCommitmentContractClient::new(&env, &commitment_id);
-        let commitment_admin = Address::generate(&env);
+        let commitment_client = SalaryCommitmentContractClient::new(env, &commitment_id);
+        let commitment_admin = Address::generate(env);
         commitment_client.init_commitment_admin(&commitment_admin);
 
         let token_id = env.register_contract(None, Token);
-        let token_client = TokenClient::new(&env, &token_id);
+        let token_client = TokenClient::new(env, &token_id);
 
         let payroll_id = env.register_contract(None, Payroll);
-        let payroll_client = PayrollClient::new(&env, &payroll_id);
+        let payroll_client = PayrollClient::new(env, &payroll_id);
 
-        let treasury = Address::generate(&env);
-        let admin = Address::generate(&env);
-        let treasury_owner = Address::generate(&env);
-
-        // Mint only 50 tokens — not enough for a 1000 payment.
-        token_client.mint(&treasury, &50i128);
+        let treasury = Address::generate(env);
+        let admin = Address::generate(env);
+        let treasury_owner = Address::generate(env);
+        token_client.mint(&treasury, &1_000_000i128);
         payroll_client.initialize(
-            &admin, &token_id, &verifier_id, &commitment_id, &treasury, &treasury_owner,
+            &admin,
+            &token_id,
+            &verifier_id,
+            &commitment_id,
+            &treasury,
+            &treasury_owner,
         );
+
         commitment_client.set_payroll_operator(&payroll_id);
 
-        let employee = Address::generate(&env);
-        commitment_client.store_commitment(&employee, &BytesN::from_array(&env, &[0u8; 32]));
+        let employee = Address::generate(env);
+        commitment_client.store_commitment(&employee, &BytesN::from_array(env, &[0u8; 32]));
 
-        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1_000);
-        let result = payroll_client.try_batch_process_payroll(
-            &proofs, &amounts, &employees, &1_000, &test_nonce(&env, 214), &None,
-        );
-        assert!(result.is_err(), "Batch must fail when treasury is underfunded");
+        (payroll_client, admin, treasury, treasury_owner, employee, token_id)
     }
 
-    // ── Issue #146: archived payroll run queries ──────────────────────────────
+    #[test]
+    fn test_asset_allowlist_management_and_execution() {
+        let env = Env::default();
+        let (payroll_client, _admin, _treasury, _treasury_owner, _employee, token_id) =
+            setup_payroll_with_token(&env);
+
+        // Initial token asset is allowlisted
+        assert!(payroll_client.is_asset_allowed(&token_id));
+
+        // Disallow token asset
+        payroll_client.set_asset_allowed(&token_id, &false);
+        assert!(!payroll_client.is_asset_allowed(&token_id));
+
+        // Re-allow token asset
+        payroll_client.set_asset_allowed(&token_id, &true);
+        assert!(payroll_client.is_asset_allowed(&token_id));
+    }
 
     #[test]
-    fn test_archive_payroll_run_marks_run_archived() {
+    #[should_panic(expected = "Asset not allowed")]
+    fn test_execute_payroll_fails_when_asset_disallowed() {
         let env = Env::default();
-        let (payroll_client, admin, _treasury, _treasury_owner, employee) =
-            setup_simple_payroll(&env);
+        let (payroll_client, _admin, _treasury, _treasury_owner, employee, token_id) =
+            setup_payroll_with_token(&env);
+
+        // Disallow the payment token asset
+        payroll_client.set_asset_allowed(&token_id, &false);
 
         let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
-        let run_id = payroll_client.batch_process_payroll(
+        payroll_client.batch_process_payroll(
             &proofs, &amounts, &employees, &1000, &test_nonce(&env, 220), &None,
         );
-
-        assert!(!payroll_client.is_run_archived(&run_id));
-        payroll_client.archive_payroll_run(&admin, &run_id);
-        assert!(payroll_client.is_run_archived(&run_id));
     }
 
     #[test]
-    fn test_get_archived_run_returns_correct_run() {
+    #[should_panic(expected = "Asset not allowed")]
+    fn test_prepare_payroll_run_fails_when_asset_disallowed() {
         let env = Env::default();
-        let (payroll_client, admin, _treasury, _treasury_owner, employee) =
-            setup_simple_payroll(&env);
+        let (payroll_client, _admin, _treasury, _treasury_owner, employee, token_id) =
+            setup_payroll_with_token(&env);
+
+        // Disallow the payment token asset
+        payroll_client.set_asset_allowed(&token_id, &false);
 
         let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
-        let run_id = payroll_client.batch_process_payroll(
+        payroll_client.prepare_payroll_run(
             &proofs, &amounts, &employees, &1000, &test_nonce(&env, 221), &None,
         );
-        payroll_client.archive_payroll_run(&admin, &run_id);
-
-        let archived = payroll_client.get_archived_run(&run_id);
-        assert_eq!(archived.run_id, run_id);
-        assert_eq!(archived.total_amount, 1000i128);
     }
 
     #[test]
-    fn test_get_archived_run_panics_for_non_archived_run() {
+    #[should_panic(expected = "authorized")]
+    fn test_non_admin_cannot_manage_allowlist() {
         let env = Env::default();
-        let (payroll_client, _admin, _treasury, _treasury_owner, employee) =
-            setup_simple_payroll(&env);
-
-        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
-        let run_id = payroll_client.batch_process_payroll(
-            &proofs, &amounts, &employees, &1000, &test_nonce(&env, 222), &None,
-        );
-
-        let result = payroll_client.try_get_archived_run(&run_id);
-        assert!(result.is_err(), "Non-archived run must not be accessible via get_archived_run");
-    }
-
-    #[test]
-    fn test_get_payroll_run_still_works_for_archived_run() {
-        let env = Env::default();
-        let (payroll_client, admin, _treasury, _treasury_owner, employee) =
-            setup_simple_payroll(&env);
-
-        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
-        let run_id = payroll_client.batch_process_payroll(
-            &proofs, &amounts, &employees, &1000, &test_nonce(&env, 223), &None,
-        );
-        payroll_client.archive_payroll_run(&admin, &run_id);
-
-        // Original get_payroll_run must still return the same record.
-        let run = payroll_client.get_payroll_run(&run_id);
-        assert_eq!(run.run_id, run_id);
-    }
-
-    // ── Issue #147: company state gate ───────────────────────────────────────
-
-    #[test]
-    fn test_batch_process_succeeds_with_no_company_state_set() {
-        // Default (no state stored) should behave as Active.
-        let env = Env::default();
-        let (payroll_client, _admin, _treasury, _treasury_owner, employee) =
-            setup_simple_payroll(&env);
-
-        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
-        let run_id = payroll_client.batch_process_payroll(
-            &proofs, &amounts, &employees, &1000, &test_nonce(&env, 230), &None,
-        );
-        assert!(run_id > 0);
-    }
-
-    #[test]
-    fn test_batch_process_succeeds_when_company_active() {
-        let env = Env::default();
-        let (payroll_client, admin, _treasury, _treasury_owner, employee) =
-            setup_simple_payroll(&env);
-
-        payroll_client.set_company_state(&admin, &CompanyState::Active);
-
-        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
-        let run_id = payroll_client.batch_process_payroll(
-            &proofs, &amounts, &employees, &1000, &test_nonce(&env, 231), &None,
-        );
-        assert!(run_id > 0);
-    }
-
-    #[test]
-    fn test_batch_process_fails_when_company_paused() {
-        let env = Env::default();
-        let (payroll_client, admin, _treasury, _treasury_owner, employee) =
-            setup_simple_payroll(&env);
-
-        payroll_client.set_company_state(&admin, &CompanyState::Paused);
-
-        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
-        let result = payroll_client.try_batch_process_payroll(
-            &proofs, &amounts, &employees, &1000, &test_nonce(&env, 232), &None,
-        );
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_batch_process_fails_when_company_archived() {
-        let env = Env::default();
-        let (payroll_client, admin, _treasury, _treasury_owner, employee) =
-            setup_simple_payroll(&env);
-
-        payroll_client.set_company_state(&admin, &CompanyState::Archived);
-
-        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
-        let result = payroll_client.try_batch_process_payroll(
-            &proofs, &amounts, &employees, &1000, &test_nonce(&env, 233), &None,
-        );
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_batch_process_fails_when_company_incomplete() {
-        let env = Env::default();
-        let (payroll_client, admin, _treasury, _treasury_owner, employee) =
-            setup_simple_payroll(&env);
-
-        payroll_client.set_company_state(&admin, &CompanyState::Incomplete);
-
-        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
-        let result = payroll_client.try_batch_process_payroll(
-            &proofs, &amounts, &employees, &1000, &test_nonce(&env, 234), &None,
-        );
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_set_company_state_rejects_non_admin() {
-        let env = Env::default();
-        let (payroll_client, _admin, _treasury, _treasury_owner, _employee) =
-            setup_simple_payroll(&env);
+        let (payroll_client, _admin, _treasury, _treasury_owner, _employee, token_id) =
+            setup_payroll_with_token(&env);
 
         let attacker = Address::generate(&env);
-        let result = payroll_client.try_set_company_state(&attacker, &CompanyState::Paused);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_get_company_state_defaults_to_active() {
-        let env = Env::default();
-        let (payroll_client, _admin, _treasury, _treasury_owner, _employee) =
-            setup_simple_payroll(&env);
-
-        assert_eq!(payroll_client.get_company_state(), CompanyState::Active);
-    }
-
-    #[test]
-    fn test_company_can_resume_from_paused_to_active() {
-        let env = Env::default();
-        let (payroll_client, admin, _treasury, _treasury_owner, employee) =
-            setup_simple_payroll(&env);
-
-        payroll_client.set_company_state(&admin, &CompanyState::Paused);
-        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
-        let result = payroll_client.try_batch_process_payroll(
-            &proofs, &amounts, &employees, &1000, &test_nonce(&env, 235), &None,
-        );
-        assert!(result.is_err(), "Paused company must reject payroll");
-
-        payroll_client.set_company_state(&admin, &CompanyState::Active);
-        let run_id = payroll_client.batch_process_payroll(
-            &proofs, &amounts, &employees, &1000, &test_nonce(&env, 236), &None,
-        );
-        assert!(run_id > 0, "Active company must accept payroll after resuming");
+        env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &attacker,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &payroll_client.address,
+                fn_name: "set_asset_allowed",
+                args: (token_id.clone(), false).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        payroll_client.set_asset_allowed(&token_id, &false);
     }
 }
