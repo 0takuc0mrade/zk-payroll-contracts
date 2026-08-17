@@ -24,28 +24,21 @@
 #[cfg(test)]
 #[allow(clippy::module_inception)]
 mod migration_tests {
-    use soroban_sdk::{
-        testutils::Address as _, Address, BytesN, Env, Vec, IntoVal,
-    };
-    use payroll_registry::{PayrollRegistryClient, EmployeeStatus};
-    use salary_commitment::SalaryCommitmentContractClient;
-    use payroll::{PayrollClient, ReconciliationStatus};
-    use payment_executor::PaymentExecutorClient;
     use audit_module::{AuditModuleClient, AuditScope};
-    use proof_verifier::{ProofVerifierClient, VerificationKey};
-    use token::{Token, TokenClient};
     use pause_manager::{PauseManager, PauseManagerClient};
+    use payment_executor::PaymentExecutorClient;
+    use payroll::{PayrollClient, ReconciliationStatus};
+    use payroll_registry::{EmployeeStatus, PayrollRegistryClient};
+    use proof_verifier::{ProofVerifierClient, VerificationKey};
+    use salary_commitment::SalaryCommitmentContractClient;
+    use soroban_sdk::{testutils::Address as _, Address, BytesN, Env, IntoVal, Vec};
+    use token::{Token, TokenClient};
 
-    use crate::state_fixtures;
     use crate::migration_helpers::{
-        self,
-        MigrationContext,
-        assert_post_migration_invariants,
-        assert_unsupported_version_handled,
-        assert_malformed_state_fails_safely,
-        mock_vk,
-        V1_STORAGE_VERSION,
+        self, assert_malformed_state_fails_safely, assert_post_migration_invariants,
+        assert_unsupported_version_handled, mock_vk, MigrationContext, V1_STORAGE_VERSION,
     };
+    use crate::state_fixtures;
 
     // ── Reusable test setup ──────────────────────────────────────────────────
 
@@ -105,9 +98,15 @@ mod migration_tests {
 
         // Verify draft_hash and metadata_hash are preserved
         let expected_draft = state_fixtures::seed_bytes32(&env, 0xDD);
-        assert_eq!(run1.draft_hash, expected_draft, "draft_hash must be preserved");
+        assert_eq!(
+            run1.draft_hash, expected_draft,
+            "draft_hash must be preserved"
+        );
         let expected_metadata = state_fixtures::seed_bytes32(&env, 0xEE);
-        assert_eq!(run1.metadata_hash, expected_metadata, "metadata_hash must be preserved");
+        assert_eq!(
+            run1.metadata_hash, expected_metadata,
+            "metadata_hash must be preserved"
+        );
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -441,7 +440,10 @@ mod migration_tests {
 
         // Closed period preserved
         let period_1 = executor_client.get_period(&ctx.company_id_1, &1);
-        assert!(period_1.is_some(), "Period 1 (closed) must survive migration");
+        assert!(
+            period_1.is_some(),
+            "Period 1 (closed) must survive migration"
+        );
         let p1 = period_1.unwrap();
         assert!(p1.closed, "Period 1 must remain closed");
         assert_eq!(p1.period_id, 1);
