@@ -10,10 +10,10 @@
 //! - Unauthorized payroll execution (execute_payment in payment_executor)
 //! - Unauthorized audit access changes (revoke_view_key, generate_view_key)
 
+use audit_module::{AuditModule, AuditModuleClient};
+use payment_executor::{ContractAddresses, PaymentExecutor, PaymentExecutorClient};
 use payroll::{Payroll, PayrollClient};
 use payroll_registry::{PayrollRegistry, PayrollRegistryClient};
-use payment_executor::{ContractAddresses, PaymentExecutor, PaymentExecutorClient};
-use audit_module::{AuditModule, AuditModuleClient};
 use proof_verifier::{ProofVerifier, ProofVerifierClient, VerificationKey};
 use salary_commitment::{SalaryCommitmentContract, SalaryCommitmentContractClient};
 use soroban_sdk::testutils::{Address as _, MockAuth, MockAuthInvoke};
@@ -108,7 +108,8 @@ fn test_unauthorized_prepare_payroll_run_fails() {
                 1000i128,
                 test_nonce(&env, 1),
                 None::<BytesN<32>>,
-            ).into_val(&env),
+            )
+                .into_val(&env),
             sub_invokes: &[],
         },
     }]);
@@ -175,7 +176,8 @@ fn test_unauthorized_batch_process_payroll_fails() {
                 1000i128,
                 test_nonce(&env, 1),
                 None::<BytesN<32>>,
-            ).into_val(&env),
+            )
+                .into_val(&env),
             sub_invokes: &[],
         },
     }]);
@@ -395,13 +397,18 @@ fn test_unauthorized_set_employee_status_fails() {
             args: (
                 company_id,
                 employee.clone(),
-                payroll_registry::EmployeeStatus::Inactive
-            ).into_val(&env),
+                payroll_registry::EmployeeStatus::Inactive,
+            )
+                .into_val(&env),
             sub_invokes: &[],
         },
     }]);
 
-    registry.set_employee_status(&company_id, &employee, &payroll_registry::EmployeeStatus::Inactive);
+    registry.set_employee_status(
+        &company_id,
+        &employee,
+        &payroll_registry::EmployeeStatus::Inactive,
+    );
 }
 
 /// Test that unauthorized users cannot remove employees.
@@ -509,7 +516,8 @@ fn test_unauthorized_execute_payment_fails() {
                 proof_c.clone(),
                 nullifier.clone(),
                 1u32,
-            ).into_val(&env),
+            )
+                .into_val(&env),
             sub_invokes: &[],
         },
     }]);
@@ -655,7 +663,10 @@ fn test_unauthorized_revoke_view_key_fails() {
 
     // Should fail with NotKeyGranter error
     assert!(result.is_err());
-    assert_eq!(result.unwrap_err().unwrap(), audit_module::AuditError::NotKeyGranter);
+    assert_eq!(
+        result.unwrap_err().unwrap(),
+        audit_module::AuditError::NotKeyGranter
+    );
 
     // Verify the key is still active
     assert!(client.verify_access(&auditor));

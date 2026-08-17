@@ -296,11 +296,7 @@ impl AuditModule {
             .set(&DataKey::AuditorKey(auditor.clone()), &updated);
 
         env.events().publish(
-            (
-                Symbol::new(&env, "ViewKeyRefreshed"),
-                admin,
-                auditor,
-            ),
+            (Symbol::new(&env, "ViewKeyRefreshed"), admin, auditor),
             (new_expiration_ledger,),
         );
         // topics : ("ViewKeyRefreshed", admin, auditor)

@@ -548,7 +548,6 @@ impl Payroll {
         )
     }
 
-
     fn is_retryable_payroll_state_internal(state: PayrollRunState) -> bool {
         matches!(state, PayrollRunState::Failed)
     }
@@ -1025,10 +1024,7 @@ impl Payroll {
             .set(&DataKey::PayrollRun(run_id), &run);
 
         e.events().publish(
-            (
-                symbol_short!("payroll"),
-                Symbol::new(&e, "run_finalized"),
-            ),
+            (symbol_short!("payroll"), Symbol::new(&e, "run_finalized")),
             (run_id, pending_run.total_amount),
         );
     }
@@ -1061,10 +1057,7 @@ impl Payroll {
         // Guard: reject cancellation if a finalized PayrollRun already exists
         // for this run_id (completed via finalize_payroll_run or
         // batch_process_payroll).
-        if e.storage()
-            .persistent()
-            .has(&DataKey::PayrollRun(run_id))
-        {
+        if e.storage().persistent().has(&DataKey::PayrollRun(run_id)) {
             panic!("Cannot cancel a finalized payroll run");
         }
 
@@ -1079,10 +1072,7 @@ impl Payroll {
 
         // Emit cancellation event with reason for audit trail
         e.events().publish(
-            (
-                symbol_short!("payroll"),
-                Symbol::new(&e, "run_cancelled"),
-            ),
+            (symbol_short!("payroll"), Symbol::new(&e, "run_cancelled")),
             (run_id, pending_run.total_amount, reason),
         );
     }
@@ -1344,7 +1334,6 @@ impl Payroll {
             (draft_id, new_total_amount, draft.amendment_count),
         );
     }
-
 
     /// Update the reconciliation status of a completed payroll run.
     ///
@@ -1778,12 +1767,9 @@ impl Payroll {
             .expect("Run not found")
     }
 
-
     /// Return `true` if the run has been marked as archived, `false` otherwise.
     pub fn is_run_archived(e: Env, run_id: u64) -> bool {
-        e.storage()
-            .persistent()
-            .has(&DataKey::ArchivedRun(run_id))
+        e.storage().persistent().has(&DataKey::ArchivedRun(run_id))
     }
 }
 
@@ -2737,11 +2723,7 @@ mod tests {
             &None,
         );
 
-        payroll_client.update_reconciliation_status(
-            &admin,
-            &run_id,
-            &ReconciliationStatus::Failed,
-        );
+        payroll_client.update_reconciliation_status(&admin, &run_id, &ReconciliationStatus::Failed);
         assert_eq!(
             payroll_client.get_payroll_run_state(&run_id),
             PayrollRunState::Failed
@@ -2798,10 +2780,8 @@ mod tests {
         let (payroll_client, _admin, _treasury, _treasury_owner, _employee) =
             setup_simple_payroll(&env);
 
-        assert!(payroll_client.is_state_transition_allowed(
-            &PayrollRunState::Draft,
-            &PayrollRunState::Validating,
-        ));
+        assert!(payroll_client
+            .is_state_transition_allowed(&PayrollRunState::Draft, &PayrollRunState::Validating,));
         assert!(payroll_client.is_state_transition_allowed(
             &PayrollRunState::Validating,
             &PayrollRunState::ProofPending,
@@ -2834,22 +2814,18 @@ mod tests {
         let (payroll_client, _admin, _treasury, _treasury_owner, _employee) =
             setup_simple_payroll(&env);
 
-        assert!(!payroll_client.is_state_transition_allowed(
-            &PayrollRunState::Draft,
-            &PayrollRunState::Completed,
-        ));
-        assert!(!payroll_client.is_state_transition_allowed(
-            &PayrollRunState::Submitted,
-            &PayrollRunState::Draft,
-        ));
-        assert!(!payroll_client.is_state_transition_allowed(
-            &PayrollRunState::Completed,
-            &PayrollRunState::Failed,
-        ));
-        assert!(!payroll_client.is_state_transition_allowed(
-            &PayrollRunState::Cancelled,
-            &PayrollRunState::Submitted,
-        ));
+        assert!(!payroll_client
+            .is_state_transition_allowed(&PayrollRunState::Draft, &PayrollRunState::Completed,));
+        assert!(!payroll_client
+            .is_state_transition_allowed(&PayrollRunState::Submitted, &PayrollRunState::Draft,));
+        assert!(!payroll_client
+            .is_state_transition_allowed(&PayrollRunState::Completed, &PayrollRunState::Failed,));
+        assert!(
+            !payroll_client.is_state_transition_allowed(
+                &PayrollRunState::Cancelled,
+                &PayrollRunState::Submitted,
+            )
+        );
     }
 
     #[test]
@@ -3757,7 +3733,16 @@ mod tests {
     }
 
     // Issue #200: Asset allowlist enforcement tests
-    fn setup_payroll_with_token(env: &Env) -> (PayrollClient<'_>, Address, Address, Address, Address, Address) {
+    fn setup_payroll_with_token(
+        env: &Env,
+    ) -> (
+        PayrollClient<'_>,
+        Address,
+        Address,
+        Address,
+        Address,
+        Address,
+    ) {
         env.mock_all_auths();
 
         let verifier_id = env.register_contract(None, ProofVerifier);
@@ -3795,7 +3780,14 @@ mod tests {
         let employee = Address::generate(env);
         commitment_client.store_commitment(&employee, &BytesN::from_array(env, &[0u8; 32]));
 
-        (payroll_client, admin, treasury, treasury_owner, employee, token_id)
+        (
+            payroll_client,
+            admin,
+            treasury,
+            treasury_owner,
+            employee,
+            token_id,
+        )
     }
 
     #[test]
@@ -3828,7 +3820,12 @@ mod tests {
 
         let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
         payroll_client.batch_process_payroll(
-            &proofs, &amounts, &employees, &1000, &test_nonce(&env, 220), &None,
+            &proofs,
+            &amounts,
+            &employees,
+            &1000,
+            &test_nonce(&env, 220),
+            &None,
         );
     }
 
@@ -3844,7 +3841,12 @@ mod tests {
 
         let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
         payroll_client.prepare_payroll_run(
-            &proofs, &amounts, &employees, &1000, &test_nonce(&env, 221), &None,
+            &proofs,
+            &amounts,
+            &employees,
+            &1000,
+            &test_nonce(&env, 221),
+            &None,
         );
     }
 

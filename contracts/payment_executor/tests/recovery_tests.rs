@@ -94,7 +94,15 @@ fn setup_system<'a>(
     executor.create_period(&company_id);
     token.mint(&treasury, &200_000);
 
-    (executor, registry, commitment_client, token, company_id, admin, treasury)
+    (
+        executor,
+        registry,
+        commitment_client,
+        token,
+        company_id,
+        admin,
+        treasury,
+    )
 }
 
 /// Register an employee and store their commitment in one call.
@@ -185,21 +193,37 @@ fn test_batch_partial_failure_earlier_payments_are_permanent() {
     nullifiers.push_back(null3.clone());
 
     let result = executor.try_execute_batch_payroll(
-        &company_id, &employees, &amounts, &proofs_a, &proofs_b, &proofs_c, &nullifiers, &1,
+        &company_id,
+        &employees,
+        &amounts,
+        &proofs_a,
+        &proofs_b,
+        &proofs_c,
+        &nullifiers,
+        &1,
     );
     assert_eq!(result.unwrap_err().unwrap(), PaymentError::ProofAlreadyUsed);
 
     // emp1 was processed before the failure — payment must be permanent.
-    assert!(executor.is_paid(&emp1, &1), "emp1 payment must survive partial failure");
+    assert!(
+        executor.is_paid(&emp1, &1),
+        "emp1 payment must survive partial failure"
+    );
     // emp3 was never reached — must remain unpaid.
-    assert!(!executor.is_paid(&emp3, &1), "emp3 must be unpaid after partial failure");
+    assert!(
+        !executor.is_paid(&emp3, &1),
+        "emp3 must be unpaid after partial failure"
+    );
     // Total: emp1 (100) + emp2 pre-seeded (300).
     assert_eq!(executor.get_total_paid(&company_id), 100 + 300);
 
     // Recovery: open period 2 and pay the missed employee.
     executor.create_period(&company_id);
     executor.execute_payment(&company_id, &emp3, &200, &pa3, &pb3, &pc3, &null3, &2);
-    assert!(executor.is_paid(&emp3, &2), "emp3 must be recoverable in the next period");
+    assert!(
+        executor.is_paid(&emp3, &2),
+        "emp3 must be recoverable in the next period"
+    );
     assert_eq!(executor.get_total_paid(&company_id), 100 + 300 + 200);
 }
 
@@ -236,9 +260,8 @@ fn test_closed_period_returns_error_and_new_period_recovers() {
     registry.add_employee(&company_id, &emp2, &commitment2);
 
     // Payment against the closed period must return PeriodClosed.
-    let closed_err = executor.try_execute_payment(
-        &company_id, &emp2, &500, &pa2, &pb2, &pc2, &null2, &1,
-    );
+    let closed_err =
+        executor.try_execute_payment(&company_id, &emp2, &500, &pa2, &pb2, &pc2, &null2, &1);
     assert_eq!(
         closed_err.unwrap_err().unwrap(),
         PaymentError::PeriodClosed,
@@ -252,7 +275,10 @@ fn test_closed_period_returns_error_and_new_period_recovers() {
     // Recovery: open period 2, pay emp2 successfully.
     executor.create_period(&company_id);
     executor.execute_payment(&company_id, &emp2, &500, &pa2, &pb2, &pc2, &null2, &2);
-    assert!(executor.is_paid(&emp2, &2), "emp2 must succeed in new period after recovery");
+    assert!(
+        executor.is_paid(&emp2, &2),
+        "emp2 must succeed in new period after recovery"
+    );
     assert_eq!(executor.get_total_paid(&company_id), 1000);
 }
 
@@ -275,7 +301,10 @@ fn test_close_nonexistent_period_returns_error_state_unchanged() {
     let (emp, _) = register_employee(&env, &registry, &commitment_client, company_id, 40);
     let (pa, pb, pc, null) = make_proof(&env, 41);
     executor.execute_payment(&company_id, &emp, &700, &pa, &pb, &pc, &null, &1);
-    assert!(executor.is_paid(&emp, &1), "Period 1 must remain usable after failed close");
+    assert!(
+        executor.is_paid(&emp, &1),
+        "Period 1 must remain usable after failed close"
+    );
 }
 
 /// Closing a period twice returns PeriodClosed on the second attempt and
@@ -346,14 +375,34 @@ fn test_batch_array_length_mismatch_leaves_state_pristine() {
     nullifiers.push_back(null2.clone());
 
     let result = executor.try_execute_batch_payroll(
-        &company_id, &employees, &amounts, &proofs_a, &proofs_b, &proofs_c, &nullifiers, &1,
+        &company_id,
+        &employees,
+        &amounts,
+        &proofs_a,
+        &proofs_b,
+        &proofs_c,
+        &nullifiers,
+        &1,
     );
-    assert_eq!(result.unwrap_err().unwrap(), PaymentError::ArrayLengthMismatch);
+    assert_eq!(
+        result.unwrap_err().unwrap(),
+        PaymentError::ArrayLengthMismatch
+    );
 
     // No payments recorded.
-    assert!(!executor.is_paid(&emp1, &1), "emp1 must be unpaid after mismatch");
-    assert!(!executor.is_paid(&emp2, &1), "emp2 must be unpaid after mismatch");
-    assert_eq!(executor.get_total_paid(&company_id), 0, "Total must be zero after mismatch");
+    assert!(
+        !executor.is_paid(&emp1, &1),
+        "emp1 must be unpaid after mismatch"
+    );
+    assert!(
+        !executor.is_paid(&emp2, &1),
+        "emp2 must be unpaid after mismatch"
+    );
+    assert_eq!(
+        executor.get_total_paid(&company_id),
+        0,
+        "Total must be zero after mismatch"
+    );
 
     // Period still open — corrected call must succeed.
     let mut employees2 = Vec::new(&env);
@@ -381,7 +430,14 @@ fn test_batch_array_length_mismatch_leaves_state_pristine() {
     nullifiers2.push_back(null2.clone());
 
     let records = executor.execute_batch_payroll(
-        &company_id, &employees2, &amounts2, &proofs_a2, &proofs_b2, &proofs_c2, &nullifiers2, &1,
+        &company_id,
+        &employees2,
+        &amounts2,
+        &proofs_a2,
+        &proofs_b2,
+        &proofs_c2,
+        &nullifiers2,
+        &1,
     );
     assert_eq!(records.len(), 2, "Corrected batch must succeed");
     assert!(executor.is_paid(&emp1, &1));
@@ -441,7 +497,16 @@ fn test_partial_batch_failure_individual_retry_completes_payroll() {
 
     // Pre-pay emp2 so the batch fails at index 1.
     let (pa2_pre, pb2_pre, pc2_pre, null2_pre) = make_proof(&env, 73);
-    executor.execute_payment(&company_id, &emp2, &400, &pa2_pre, &pb2_pre, &pc2_pre, &null2_pre, &1);
+    executor.execute_payment(
+        &company_id,
+        &emp2,
+        &400,
+        &pa2_pre,
+        &pb2_pre,
+        &pc2_pre,
+        &null2_pre,
+        &1,
+    );
 
     // Fresh proof for emp2 in the batch (passes nullifier check, fails AlreadyPaid).
     let (pa1, pb1, pc1, null1) = make_proof(&env, 74);
@@ -479,18 +544,34 @@ fn test_partial_batch_failure_individual_retry_completes_payroll() {
     nullifiers.push_back(null3.clone());
 
     let batch_err = executor.try_execute_batch_payroll(
-        &company_id, &employees, &amounts, &proofs_a, &proofs_b, &proofs_c, &nullifiers, &1,
+        &company_id,
+        &employees,
+        &amounts,
+        &proofs_a,
+        &proofs_b,
+        &proofs_c,
+        &nullifiers,
+        &1,
     );
     assert_eq!(batch_err.unwrap_err().unwrap(), PaymentError::AlreadyPaid);
 
     // emp1 paid before the failure (index 0).
-    assert!(executor.is_paid(&emp1, &1), "emp1 must be paid before failure");
+    assert!(
+        executor.is_paid(&emp1, &1),
+        "emp1 must be paid before failure"
+    );
     // emp3 never reached (index 2).
-    assert!(!executor.is_paid(&emp3, &1), "emp3 must be unpaid after partial failure");
+    assert!(
+        !executor.is_paid(&emp3, &1),
+        "emp3 must be unpaid after partial failure"
+    );
 
     // Recovery: pay emp3 individually in the same open period.
     executor.execute_payment(&company_id, &emp3, &200, &pa3, &pb3, &pc3, &null3, &1);
-    assert!(executor.is_paid(&emp3, &1), "emp3 must succeed after individual recovery");
+    assert!(
+        executor.is_paid(&emp3, &1),
+        "emp3 must succeed after individual recovery"
+    );
     assert_eq!(executor.get_total_paid(&company_id), 100 + 400 + 200);
 }
 
@@ -546,13 +627,26 @@ fn test_batch_failure_at_index_zero_leaves_contract_clean() {
     nullifiers.push_back(null2.clone());
 
     let err = executor.try_execute_batch_payroll(
-        &company_id, &employees, &amounts, &proofs_a, &proofs_b, &proofs_c, &nullifiers, &2,
+        &company_id,
+        &employees,
+        &amounts,
+        &proofs_a,
+        &proofs_b,
+        &proofs_c,
+        &nullifiers,
+        &2,
     );
     assert_eq!(err.unwrap_err().unwrap(), PaymentError::ProofAlreadyUsed);
 
     // Neither employee paid in period 2.
-    assert!(!executor.is_paid(&emp1, &2), "emp1 must not be paid in period 2");
-    assert!(!executor.is_paid(&emp2, &2), "emp2 must not be paid in period 2");
+    assert!(
+        !executor.is_paid(&emp1, &2),
+        "emp1 must not be paid in period 2"
+    );
+    assert!(
+        !executor.is_paid(&emp2, &2),
+        "emp2 must not be paid in period 2"
+    );
 
     // Period 2 is still open; emp2 can be paid individually with its fresh proof.
     executor.execute_payment(&company_id, &emp2, &200, &pa2, &pb2, &pc2, &null2, &2);

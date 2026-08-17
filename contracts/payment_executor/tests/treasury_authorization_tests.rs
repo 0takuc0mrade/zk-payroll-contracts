@@ -79,10 +79,10 @@ fn setup_system_no_auth<'a>(
     registry.add_employee(&company_id, &employee, &commitment);
 
     // Turn off mock_all_auths to test explicit auths
-    // Actually mock_all_auths() applies globally, we can't un-mock it easily in Soroban tests, 
+    // Actually mock_all_auths() applies globally, we can't un-mock it easily in Soroban tests,
     // unless we don't call it at all, or just use it but rely on should_panic for auth checks.
-    // Wait, mock_all_auths() replaces the auth manager. 
-    
+    // Wait, mock_all_auths() replaces the auth manager.
+
     (
         executor,
         registry,
@@ -138,7 +138,8 @@ fn test_execution_with_correct_treasury_context() {
                     proof_c.clone(),
                     nullifier.clone(),
                     1u32,
-                ).into_val(&env),
+                )
+                    .into_val(&env),
                 sub_invokes: &[],
             },
         },
@@ -147,11 +148,7 @@ fn test_execution_with_correct_treasury_context() {
             invoke: &MockAuthInvoke {
                 contract: &token_id,
                 fn_name: "transfer",
-                args: (
-                    treasury.clone(),
-                    employee.clone(),
-                    1000i128,
-                ).into_val(&env),
+                args: (treasury.clone(), employee.clone(), 1000i128).into_val(&env),
                 sub_invokes: &[],
             },
         },
@@ -210,7 +207,8 @@ fn test_mismatched_treasury_account_rejection() {
                     proof_c.clone(),
                     nullifier.clone(),
                     1u32,
-                ).into_val(&env),
+                )
+                    .into_val(&env),
                 sub_invokes: &[],
             },
         },
@@ -223,7 +221,8 @@ fn test_mismatched_treasury_account_rejection() {
                     treasury.clone(), // actual transfer attempts from real treasury
                     employee.clone(),
                     1000i128,
-                ).into_val(&env),
+                )
+                    .into_val(&env),
                 sub_invokes: &[],
             },
         },
@@ -259,11 +258,11 @@ fn test_unsupported_asset_rejection() {
 
     // Remove the allowed asset to simulate unsupported asset
     env.mock_all_auths();
-    
+
     // Set a dummy admin to allow calling set_asset_allowed
     let executor_admin = Address::generate(&env);
     executor.set_executor_admin(&executor_admin);
-    
+
     // Disallow the token asset
     executor.set_asset_allowed(&token_id, &false);
 

@@ -985,4 +985,3 @@ fn test_verify_payroll_metadata_revoked_auditor_rejected() {
         client.try_verify_payroll_metadata(&auditor, &hash, &hash, &AuditScope::FullCompany);
     assert_eq!(result.unwrap_err().unwrap(), AuditError::KeyNotFound);
 }
-

@@ -105,7 +105,15 @@ fn setup_system<'a>(
         token.mint(&treasury, &treasury_balance);
     }
 
-    (executor, registry, commitment_client, token, company_id, admin, treasury)
+    (
+        executor,
+        registry,
+        commitment_client,
+        token,
+        company_id,
+        admin,
+        treasury,
+    )
 }
 
 /// Register an employee and store their commitment in one call.
@@ -232,7 +240,10 @@ fn test_is_paid_is_scoped_to_employee_and_period() {
     executor.execute_payment(&company_id, &emp, &5_000, &pa1, &pb1, &pc1, &null1, &1);
 
     assert!(executor.is_paid(&emp, &1), "should be paid in period 1");
-    assert!(!executor.is_paid(&emp, &2), "must NOT be marked paid in period 2 yet");
+    assert!(
+        !executor.is_paid(&emp, &2),
+        "must NOT be marked paid in period 2 yet"
+    );
 
     // Open period 2 and pay with a fresh nullifier.
     executor.close_period(&company_id, &1);
@@ -240,7 +251,10 @@ fn test_is_paid_is_scoped_to_employee_and_period() {
     let (pa2, pb2, pc2, null2) = make_proof(&env, 32);
     executor.execute_payment(&company_id, &emp, &6_000, &pa2, &pb2, &pc2, &null2, &2);
 
-    assert!(executor.is_paid(&emp, &1), "period 1 paid flag must still be set");
+    assert!(
+        executor.is_paid(&emp, &1),
+        "period 1 paid flag must still be set"
+    );
     assert!(executor.is_paid(&emp, &2), "should now be paid in period 2");
 }
 
@@ -271,9 +285,8 @@ fn test_reused_nullifier_is_rejected_and_total_unchanged() {
     executor.create_period(&company_id);
 
     // Replay the same nullifier for a different employee in period 2.
-    let result = executor.try_execute_payment(
-        &company_id, &emp2, &20_000, &pa, &pb, &pc, &null, &2,
-    );
+    let result =
+        executor.try_execute_payment(&company_id, &emp2, &20_000, &pa, &pb, &pc, &null, &2);
     assert_eq!(
         result.unwrap_err().unwrap(),
         PaymentError::ProofAlreadyUsed,
@@ -307,9 +320,8 @@ fn test_closed_period_rejects_payment_and_total_unchanged() {
 
     let (emp2, _) = register_employee(&env, &registry, &commitment_client, company_id, 51);
     let (pa2, pb2, pc2, null2) = make_proof(&env, 51);
-    let result = executor.try_execute_payment(
-        &company_id, &emp2, &5_000, &pa2, &pb2, &pc2, &null2, &1,
-    );
+    let result =
+        executor.try_execute_payment(&company_id, &emp2, &5_000, &pa2, &pb2, &pc2, &null2, &1);
     assert_eq!(result.unwrap_err().unwrap(), PaymentError::PeriodClosed);
     assert_eq!(
         executor.get_total_paid(&company_id),
@@ -349,7 +361,14 @@ fn test_batch_total_equals_sum_of_amounts() {
     }
 
     executor.execute_batch_payroll(
-        &company_id, &employees, &amounts, &proofs_a, &proofs_b, &proofs_c, &nullifiers, &1,
+        &company_id,
+        &employees,
+        &amounts,
+        &proofs_a,
+        &proofs_b,
+        &proofs_c,
+        &nullifiers,
+        &1,
     );
 
     assert_eq!(
@@ -382,11 +401,37 @@ fn test_company_totals_are_isolated() {
     let (pa_a, pb_a, pc_a, null_a) = make_proof(&env, 70);
     let (pa_b, pb_b, pc_b, null_b) = make_proof(&env, 71);
 
-    executor.execute_payment(&company_id_a, &emp_a, &40_000, &pa_a, &pb_a, &pc_a, &null_a, &1);
-    executor.execute_payment(&company_id_b, &emp_b, &55_000, &pa_b, &pb_b, &pc_b, &null_b, &1);
+    executor.execute_payment(
+        &company_id_a,
+        &emp_a,
+        &40_000,
+        &pa_a,
+        &pb_a,
+        &pc_a,
+        &null_a,
+        &1,
+    );
+    executor.execute_payment(
+        &company_id_b,
+        &emp_b,
+        &55_000,
+        &pa_b,
+        &pb_b,
+        &pc_b,
+        &null_b,
+        &1,
+    );
 
-    assert_eq!(executor.get_total_paid(&company_id_a), 40_000, "company A total contaminated");
-    assert_eq!(executor.get_total_paid(&company_id_b), 55_000, "company B total contaminated");
+    assert_eq!(
+        executor.get_total_paid(&company_id_a),
+        40_000,
+        "company A total contaminated"
+    );
+    assert_eq!(
+        executor.get_total_paid(&company_id_b),
+        55_000,
+        "company B total contaminated"
+    );
 }
 
 // ===========================================================================
@@ -400,7 +445,10 @@ fn test_period_payment_count_increments_per_payment() {
         setup_system(&env, 500_000);
 
     let period_before = executor.get_period(&company_id, &1).unwrap();
-    assert_eq!(period_before.payment_count, 0, "fresh period must start at 0");
+    assert_eq!(
+        period_before.payment_count, 0,
+        "fresh period must start at 0"
+    );
 
     for i in 0u8..3 {
         let seed = 80 + i;
@@ -436,9 +484,8 @@ fn test_already_paid_retry_does_not_alter_total() {
 
     // Different nullifier so it doesn't fail on ProofAlreadyUsed first.
     let (pa2, pb2, pc2, null2) = make_proof(&env, 91);
-    let result = executor.try_execute_payment(
-        &company_id, &emp, &12_000, &pa2, &pb2, &pc2, &null2, &1,
-    );
+    let result =
+        executor.try_execute_payment(&company_id, &emp, &12_000, &pa2, &pb2, &pc2, &null2, &1);
     assert_eq!(result.unwrap_err().unwrap(), PaymentError::AlreadyPaid);
     assert_eq!(
         executor.get_total_paid(&company_id),
@@ -461,7 +508,10 @@ fn test_zero_amount_sets_paid_flag_but_contributes_zero_to_total() {
     let (pa, pb, pc, null) = make_proof(&env, 100);
     executor.execute_payment(&company_id, &emp, &0, &pa, &pb, &pc, &null, &1);
 
-    assert!(executor.is_paid(&emp, &1), "zero-amount employee must be marked paid");
+    assert!(
+        executor.is_paid(&emp, &1),
+        "zero-amount employee must be marked paid"
+    );
     assert_eq!(
         executor.get_total_paid(&company_id),
         0,
@@ -489,7 +539,16 @@ fn test_cumulative_total_across_multiple_periods() {
 
         let (emp, _) = register_employee(&env, &registry, &commitment_client, company_id, seed);
         let (pa, pb, pc, null) = make_proof(&env, seed);
-        executor.execute_payment(&company_id, &emp, &amount, &pa, &pb, &pc, &null, &period_num);
+        executor.execute_payment(
+            &company_id,
+            &emp,
+            &amount,
+            &pa,
+            &pb,
+            &pc,
+            &null,
+            &period_num,
+        );
 
         expected += amount;
         assert_eq!(executor.get_total_paid(&company_id), expected);

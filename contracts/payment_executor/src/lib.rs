@@ -152,7 +152,6 @@ impl PaymentExecutor {
         );
     }
 
-
     /// Set the executor-level admin (one-time, protected by auth).
     pub fn set_executor_admin(env: Env, admin: Address) {
         if env.storage().persistent().has(&DataKey::ExecutorAdmin) {
@@ -192,10 +191,7 @@ impl PaymentExecutor {
             .set(&DataKey::AllowedAsset(asset.clone()), &allowed);
 
         env.events().publish(
-            (
-                Symbol::new(&env, "TreasuryAssetAllowedUpdated"),
-                asset,
-            ),
+            (Symbol::new(&env, "TreasuryAssetAllowedUpdated"), asset),
             (allowed, env.ledger().timestamp()),
         );
     }
@@ -812,7 +808,10 @@ mod tests {
         let _ = client.create_period(&company_id);
 
         let result = client.try_create_period(&company_id);
-        assert_eq!(result.unwrap_err().unwrap(), PaymentError::PeriodAlreadyExists);
+        assert_eq!(
+            result.unwrap_err().unwrap(),
+            PaymentError::PeriodAlreadyExists
+        );
     }
 
     #[test]
@@ -1394,7 +1393,12 @@ mod tests {
         assert_eq!(after_init, before_init + 1);
 
         let init_event = env.events().all().get(after_init - 1).unwrap();
-        let sym0: Symbol = init_event.1.get(0).unwrap().try_into_val(&env.clone()).unwrap();
+        let sym0: Symbol = init_event
+            .1
+            .get(0)
+            .unwrap()
+            .try_into_val(&env.clone())
+            .unwrap();
         assert_eq!(sym0, Symbol::new(&env, "TreasuryAssetAllowedUpdated"));
 
         let executor_admin = Address::generate(&env);
@@ -1407,7 +1411,12 @@ mod tests {
         assert_eq!(after_set, before_set + 1);
 
         let set_event = env.events().all().get(after_set - 1).unwrap();
-        let set_sym0: Symbol = set_event.1.get(0).unwrap().try_into_val(&env.clone()).unwrap();
+        let set_sym0: Symbol = set_event
+            .1
+            .get(0)
+            .unwrap()
+            .try_into_val(&env.clone())
+            .unwrap();
         assert_eq!(set_sym0, Symbol::new(&env, "TreasuryAssetAllowedUpdated"));
     }
 
@@ -1525,4 +1534,3 @@ mod tests {
         );
     }
 }
-
