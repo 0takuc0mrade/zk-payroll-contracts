@@ -3,7 +3,6 @@ use soroban_sdk::{
     contract, contractimpl, contracttype, token as soroban_token, Address, BytesN, Env, Symbol, Vec,
 };
 
-
 use pause_manager::PauseManagerClient;
 use proof_verifier::ProofVerifierClient;
 use salary_commitment::SalaryCommitmentContractClient;
