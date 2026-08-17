@@ -3,7 +3,6 @@
 use pause_manager::PauseManagerClient;
 use soroban_sdk::{contract, contractimpl, contracttype, Address, BytesN, Env, Symbol, Vec};
 
-use payroll_events;
 
 // ---------------------------------------------------------------------------
 // Operational roles

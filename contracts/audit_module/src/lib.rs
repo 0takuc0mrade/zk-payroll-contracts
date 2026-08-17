@@ -1,7 +1,6 @@
 #![no_std]
 
 use pause_manager::PauseManagerClient;
-use payroll_events;
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, xdr::ToXdr, Address, Bytes, BytesN, Env,
     Symbol, Vec,

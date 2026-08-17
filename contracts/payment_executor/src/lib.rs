@@ -4,7 +4,6 @@ extern crate alloc;
 use alloc::format;
 
 use pause_manager::PauseManagerClient;
-use payroll_events;
 use payroll_registry::{CompanyInfo, PayrollRegistryClient};
 use proof_verifier::{Groth16Proof, ProofVerifierClient};
 use salary_commitment::SalaryCommitmentContractClient;
