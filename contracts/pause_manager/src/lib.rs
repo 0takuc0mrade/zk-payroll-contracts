@@ -1,8 +1,6 @@
 #![no_std]
 
 #[allow(unused_imports)]
-use payroll_events;
-#[allow(unused_imports)]
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Symbol};
 
 #[contracttype]
