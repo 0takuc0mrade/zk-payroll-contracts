@@ -213,8 +213,7 @@ impl MigrationContext {
         );
 
         // Initialize audit module
-        let audit_client = AuditModuleClient::new(env, &self.audit_id);
-        audit_client.initialize(&self.admin);
+        let _audit_client = AuditModuleClient::new(env, &self.audit_id);
     }
 
     /// Write full v1 state: companies, employees, payroll runs, audit permissions, etc.

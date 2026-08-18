@@ -3,6 +3,20 @@
 version = 4
 
 [[package]]
+name = "access_control_tests"
+version = "0.1.0"
+dependencies = [
+ "audit_module",
+ "payment_executor",
+ "payroll",
+ "payroll_registry",
+ "proof_verifier",
+ "salary_commitment",
+ "soroban-sdk",
+ "token",
+]
+
+[[package]]
 name = "addr2line"
 version = "0.25.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1813,6 +1827,7 @@ name = "payroll"
 version = "0.1.0"
 dependencies = [
  "pause_manager",
+ "payroll_events",
  "payroll_registry",
  "proof_verifier",
  "salary_commitment",
