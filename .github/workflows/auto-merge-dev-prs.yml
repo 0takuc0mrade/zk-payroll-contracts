@@ -25,7 +25,10 @@ jobs:
 
       - name: Check CI, conflicts, and merge when ready
         uses: actions/github-script@v7
+        env:
+          HAS_AUTO_MERGE_TOKEN: ${{ secrets.AUTO_MERGE_TOKEN != '' }}
         with:
+          github-token: ${{ secrets.AUTO_MERGE_TOKEN || github.token }}
           script: |
             const pr = context.payload.pull_request;
             const owner = context.repo.owner;
@@ -135,6 +138,13 @@ jobs:
                 merge_method: "squash",
               });
             } catch (error) {
-              await comment(`${mention} CI passed, but GitHub could not auto-merge this PR: ${error.message}. Please check branch rules or merge requirements.`);
+              const hasAutoMergeToken = process.env.HAS_AUTO_MERGE_TOKEN === "true";
+              if (error.message.includes("Resource not accessible by integration") && !hasAutoMergeToken) {
+                await comment(`${mention} CI passed and no merge conflicts were detected. The remaining problem is repository automation permission: this workflow is still using the default GITHUB_TOKEN, and GitHub will not let that token merge this PR. Contributor action needed: none. Maintainer action needed: add an AUTO_MERGE_TOKEN repository or organization secret with permission to merge PRs, then rerun this job, or merge the PR manually after review.`);
+              } else if (error.message.includes("Resource not accessible by integration")) {
+                await comment(`${mention} CI passed and no merge conflicts were detected, but GitHub still blocked the configured AUTO_MERGE_TOKEN from merging this PR. Contributor action needed: none. Maintainer action needed: check that AUTO_MERGE_TOKEN belongs to a maintainer with write/admin access, has repo and workflow scope or fine-grained Contents/Pull requests read-write access, is authorized for the zkpayroll organization, and is allowed by the dev branch ruleset; otherwise merge manually after review.`);
+              } else {
+                await comment(`${mention} CI passed and no merge conflicts were detected, but GitHub blocked the auto-merge: ${error.message}. Contributor action needed: none unless a maintainer asks for code changes. Maintainer action needed: check required reviews, branch protection/rulesets, and merge settings, or manually merge after review.`);
+              }
               throw error;
             }
