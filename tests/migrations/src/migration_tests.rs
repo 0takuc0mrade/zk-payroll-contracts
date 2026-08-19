@@ -22,7 +22,7 @@
 //! - `mg_flow_*` — Active flow continuation tests
 
 #[cfg(test)]
-#[allow(clippy::module_inception)]
+#[allow(clippy::module_inception, unused_imports, unused_variables)]
 mod migration_tests {
     use audit_module::{AuditModuleClient, AuditScope};
     use pause_manager::{PauseManager, PauseManagerClient};
