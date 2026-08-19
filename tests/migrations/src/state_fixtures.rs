@@ -185,7 +185,11 @@ pub fn write_v1_payroll_run_fixture(
     employee_count: u32,
     status: ReconciliationStatus,
 ) -> PayrollRunFixture {
-    let timestamp = env.ledger().timestamp();
+    let timestamp = if env.ledger().timestamp() > 0 {
+        env.ledger().timestamp()
+    } else {
+        1_000_000
+    };
 
     let run = PayrollRun {
         run_id,
@@ -379,7 +383,11 @@ pub fn write_v1_emergency_withdrawal(
     let request = EmergencyWithdrawalRequest {
         amount,
         recipient: recipient.clone(),
-        requested_at: env.ledger().timestamp(),
+        requested_at: if env.ledger().timestamp() > 0 {
+            env.ledger().timestamp()
+        } else {
+            1_000_000
+        },
         approved: false,
     };
 

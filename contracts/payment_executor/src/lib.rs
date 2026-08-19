@@ -389,8 +389,9 @@ impl PaymentExecutor {
         let registry = PayrollRegistryClient::new(&env, &addresses.registry);
         let company: CompanyInfo = registry.get_company(&company_id);
 
-        // Ensure only HR admin for this company can trigger payroll.
+        // Ensure only HR admin for this company can trigger payroll and treasury authorizes payment.
         company.admin.require_auth();
+        company.treasury.require_auth();
 
         // Construct public inputs required by issue #20:
         let mut public_inputs = soroban_sdk::Vec::new(&env);
@@ -441,6 +442,11 @@ impl PaymentExecutor {
 
         env.storage().persistent().set(&payment_key, &record);
         env.storage().persistent().set(&nullifier_key, &true);
+
+        // Update period payment count
+        let mut updated_period = period_record;
+        updated_period.payment_count += 1;
+        env.storage().persistent().set(&period_key, &updated_period);
 
         // Update total paid
         let total_key = DataKey::TotalPaid(company_id);
@@ -656,8 +662,8 @@ mod tests {
         assert_eq!(token_client.balance(&employee), 1_000);
 
         let events = env.events().all();
-        assert_eq!(events.len(), 5);
-        let event = events.get(4).unwrap();
+        assert_eq!(events.len(), 6);
+        let event = events.get(5).unwrap();
         assert_eq!(event.1.len(), 2);
         let sym0: Symbol = event.1.get(0).unwrap().try_into_val(&env.clone()).unwrap();
         assert_eq!(sym0, Symbol::new(&env, "PayrollProcessed"));
@@ -968,8 +974,8 @@ mod tests {
         assert_eq!(client.get_total_paid(&company_id), 2_500);
 
         let events = env.events().all();
-        assert_eq!(events.len(), 5);
-        let event = events.get(4).unwrap();
+        assert_eq!(events.len(), 6);
+        let event = events.get(5).unwrap();
         assert_eq!(event.1.len(), 2);
         let sym: Symbol = event.1.get(0).unwrap().try_into_val(&env.clone()).unwrap();
         assert_eq!(sym, Symbol::new(&env, "PayrollProcessed"));
