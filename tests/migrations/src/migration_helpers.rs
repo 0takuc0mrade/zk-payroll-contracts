@@ -17,10 +17,7 @@
 //!
 //! let mut ctx = setup_full_v1_state(&env);
 //! // Apply upgrade / migration function
-//! ctx.simulate_upgrade_v2();
-//! // Assert all state is preserved
-//! assert_post_migration_invariants(&env, &ctx);
-//! ```
+#![allow(unused_imports, unused_variables)]
 
 use audit_module::{AuditModule, AuditModuleClient, AuditScope, ViewKeyRecord};
 use pause_manager::{PauseManager, PauseManagerClient};

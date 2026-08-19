@@ -26,7 +26,7 @@
 //!
 //! let env = Env::default();
 //! let (company_id, fixture) = write_v1_company_fixture(&env, &contract_id);
-//! ```
+#![allow(unused_imports, unused_variables)]
 
 use payroll_registry::{CompanyInfo, EmployeeStatus, PendingCompanyRotation};
 use salary_commitment::{CommitmentSnapshot, PaymentNullifier, SalaryCommitment};

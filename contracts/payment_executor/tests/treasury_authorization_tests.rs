@@ -97,6 +97,7 @@ fn setup_system_no_auth<'a>(
     )
 }
 
+#[allow(dead_code)]
 fn amount_to_public_input(env: &Env, amount: i128) -> BytesN<32> {
     let mut bytes = [0u8; 32];
     let amount_u128 = amount as u128;
@@ -116,7 +117,7 @@ fn test_execution_with_correct_treasury_context() {
         admin,
         treasury,
         employee,
-        token_id,
+        _token_id,
     ) = setup_system_no_auth(&env);
 
     let proof_a = BytesN::from_array(&env, &[1u8; 64]);
