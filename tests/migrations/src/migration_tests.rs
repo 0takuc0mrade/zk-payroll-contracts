@@ -455,6 +455,9 @@ mod migration_tests {
         let p2 = period_2.unwrap();
         assert!(!p2.closed, "Period 2 must remain open");
 
+        // Close open period so a new period can be created
+        let _ = executor_client.close_period(&ctx.company_id_2, &1);
+
         // New periods can be created post-migration
         executor_client.close_period(&ctx.company_id_2, &1);
         let new_p = executor_client.create_period(&ctx.company_id_2);

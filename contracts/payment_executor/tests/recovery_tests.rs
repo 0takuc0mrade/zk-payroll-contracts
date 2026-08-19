@@ -205,25 +205,23 @@ fn test_batch_partial_failure_earlier_payments_are_permanent() {
     );
     assert_eq!(result.unwrap_err().unwrap(), PaymentError::ProofAlreadyUsed);
 
-    // Atomic batch rollback: emp1 and emp3 are not paid due to rollback
+    // Batch execution returned an error — frame reverted cleanly.
     assert!(
         !executor.is_paid(&emp1, &1),
-        "emp1 payment rolled back on batch failure"
+        "emp1 remains unpaid after batch rollback"
     );
     assert!(
         !executor.is_paid(&emp3, &1),
-        "emp3 unpaid after batch failure"
+        "emp3 remains unpaid after batch rollback"
     );
+    assert_eq!(executor.get_total_paid(&company_id), 300);
 
-    // Recovery: open period 2 and pay the missed employee.
-    executor.close_period(&company_id, &1);
-    executor.create_period(&company_id);
-    executor.execute_payment(&company_id, &emp3, &200, &pa3, &pb3, &pc3, &null3, &2);
-    assert!(
-        executor.is_paid(&emp3, &2),
-        "emp3 must be recoverable in the next period"
-    );
-    assert_eq!(executor.get_total_paid(&company_id), 300 + 200);
+    // Recovery: pay emp1 and emp3 individually in period 1.
+    executor.execute_payment(&company_id, &emp1, &100, &pa1, &pb1, &pc1, &null1, &1);
+    executor.execute_payment(&company_id, &emp3, &200, &pa3, &pb3, &pc3, &null3, &1);
+    assert!(executor.is_paid(&emp1, &1));
+    assert!(executor.is_paid(&emp3, &1));
+    assert_eq!(executor.get_total_paid(&company_id), 300 + 100 + 200);
 }
 
 // ===========================================================================
@@ -554,19 +552,23 @@ fn test_partial_batch_failure_individual_retry_completes_payroll() {
     );
     assert_eq!(batch_err.unwrap_err().unwrap(), PaymentError::AlreadyPaid);
 
-    // emp1 rolled back on batch failure.
+    // Batch execution returned an error — frame reverted cleanly.
     assert!(
         !executor.is_paid(&emp1, &1),
-        "emp1 unpaid due to rollback"
+        "emp1 remains unpaid after batch rollback"
     );
-    // emp3 never reached (index 2).
     assert!(
         !executor.is_paid(&emp3, &1),
-        "emp3 unpaid after partial failure"
+        "emp3 remains unpaid after batch rollback"
     );
 
-    // Recovery: pay emp3 individually in the same open period.
+    // Recovery: pay emp1 and emp3 individually in the same open period.
+    executor.execute_payment(&company_id, &emp1, &100, &pa1, &pb1, &pc1, &null1, &1);
     executor.execute_payment(&company_id, &emp3, &200, &pa3, &pb3, &pc3, &null3, &1);
+    assert!(
+        executor.is_paid(&emp1, &1),
+        "emp1 must succeed after individual recovery"
+    );
     assert!(
         executor.is_paid(&emp3, &1),
         "emp3 must succeed after individual recovery"

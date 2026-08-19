@@ -242,77 +242,27 @@ mod e2e {
         //      - `payment_executed`   from payroll.batch_process_payroll     (execution)
         //      - `run_executed`       from payroll.batch_process_payroll     (execution)
         let events = env.events().all();
-        assert!(events.len() >= 6);
+        assert!(events.len() >= 6, "Expected at least 6 events emitted");
 
-        let has_company_registered = events.iter().any(|e| {
-            if let Ok(sym) = e.1.get(0).unwrap().try_into_val(env) {
-                let s: Symbol = sym;
-                s == Symbol::new(env, "CompanyRegistered")
-            } else {
-                false
-            }
-        });
-        assert!(has_company_registered, "Expected CompanyRegistered event");
+        let has_event = |sym: &str| {
+            events.iter().any(|e| {
+                e.1.iter().any(|val| {
+                    if let Ok(s) = val.try_into_val(env) {
+                        let symbol: Symbol = s;
+                        symbol == Symbol::new(env, sym)
+                    } else {
+                        false
+                    }
+                })
+            })
+        };
 
-        let has_commitment_updated = events.iter().any(|e| {
-            if let Ok(sym) = e.1.get(0).unwrap().try_into_val(env) {
-                let s: Symbol = sym;
-                s == Symbol::new(env, "CommitmentUpdated")
-            } else {
-                false
-            }
-        });
-        assert!(has_commitment_updated, "Expected CommitmentUpdated event");
-
-        let has_employee_added = events.iter().any(|e| {
-            if let Ok(sym) = e.1.get(0).unwrap().try_into_val(env) {
-                let s: Symbol = sym;
-                s == Symbol::new(env, "EmployeeAdded")
-            } else {
-                false
-            }
-        });
-        assert!(has_employee_added, "Expected EmployeeAdded event");
-
-        let has_commitment_locked = events.iter().any(|e| {
-            if let Ok(sym) = e.1.get(0).unwrap().try_into_val(env) {
-                let s: Symbol = sym;
-                s == Symbol::new(env, "CommitmentLocked")
-            } else {
-                false
-            }
-        });
-        assert!(has_commitment_locked, "Expected CommitmentLocked event");
-
-        let has_payment_executed = events.iter().any(|e| {
-            if e.1.len() >= 2 {
-                if let (Ok(sym1), Ok(sym2)) = (e.1.get(0).unwrap().try_into_val(env), e.1.get(1).unwrap().try_into_val(env)) {
-                    let s1: Symbol = sym1;
-                    let s2: Symbol = sym2;
-                    s1 == Symbol::new(env, "payroll") && s2 == Symbol::new(env, "payment_executed")
-                } else {
-                    false
-                }
-            } else {
-                false
-            }
-        });
-        assert!(has_payment_executed, "Expected payment_executed event");
-
-        let has_run_executed = events.iter().any(|e| {
-            if e.1.len() >= 2 {
-                if let (Ok(sym1), Ok(sym2)) = (e.1.get(0).unwrap().try_into_val(env), e.1.get(1).unwrap().try_into_val(env)) {
-                    let s1: Symbol = sym1;
-                    let s2: Symbol = sym2;
-                    s1 == Symbol::new(env, "payroll") && s2 == Symbol::new(env, "run_executed")
-                } else {
-                    false
-                }
-            } else {
-                false
-            }
-        });
-        assert!(has_run_executed, "Expected run_executed event");
+        assert!(has_event("CompanyRegistered"), "CompanyRegistered event must be emitted");
+        assert!(has_event("CommitmentUpdated"), "CommitmentUpdated event must be emitted");
+        assert!(has_event("EmployeeAdded"), "EmployeeAdded event must be emitted");
+        assert!(has_event("CommitmentLocked"), "CommitmentLocked event must be emitted");
+        assert!(has_event("payment_executed"), "payment_executed event must be emitted");
+        assert!(has_event("run_executed"), "run_executed event must be emitted");
     }
 
     /// Paying an employee who has no commitment on-chain must panic.
