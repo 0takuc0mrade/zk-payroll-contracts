@@ -249,7 +249,7 @@ mod e2e {
 
         for event in events.iter() {
             let topics = event.1;
-            if topics.len() > 0 {
+            if !topics.is_empty() {
                 if let Ok(sym) = topics.get(0).unwrap().try_into_val(&env.clone()) {
                     let sym: Symbol = sym;
                     if sym == Symbol::new(env, "CompanyRegistered") {

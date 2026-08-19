@@ -2109,6 +2109,7 @@ impl Payroll {
     /// Get the review record for a payroll run, if any.
     pub fn get_run_review(e: Env, run_id: u64) -> Option<RunReview> {
         e.storage().persistent().get(&DataKey::RunReview(run_id))
+    }
     /// Read contract dependency addresses configured during initialization.
     pub fn get_addresses(e: Env) -> ContractAddresses {
         e.storage()
