@@ -17,10 +17,7 @@
 //!
 //! let mut ctx = setup_full_v1_state(&env);
 //! // Apply upgrade / migration function
-//! ctx.simulate_upgrade_v2();
-//! // Assert all state is preserved
-//! assert_post_migration_invariants(&env, &ctx);
-//! ```
+#![allow(unused_imports, unused_variables)]
 
 use audit_module::{AuditModule, AuditModuleClient, AuditScope, ViewKeyRecord};
 use pause_manager::{PauseManager, PauseManagerClient};
@@ -176,7 +173,7 @@ impl MigrationContext {
         // Initialize commitment contract admin
         let commitment_client = SalaryCommitmentContractClient::new(env, &self.commitment_id);
         commitment_client.init_commitment_admin(&self.admin);
-        commitment_client.set_payroll_operator(&self.payroll_operator);
+        commitment_client.set_payroll_operator(&self.payroll_id);
 
         // Initialize token & mint to treasury
         let token_client = TokenClient::new(env, &self.token_id);
@@ -360,6 +357,7 @@ impl MigrationContext {
         // ── Mark flags ───────────────────────────────────────────────────
         self.has_companies = true;
         self.has_employees = true;
+        self.has_payroll_runs = true;
     }
 
     /// Simulate an upgrade by re-registering the v2 contract and re-initializing.

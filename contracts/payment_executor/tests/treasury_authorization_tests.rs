@@ -65,6 +65,7 @@ fn setup_system_no_auth<'a>(
 
     let commitment_admin = Address::generate(env);
     commitment_client.init_commitment_admin(&commitment_admin);
+    commitment_client.set_payroll_operator(&executor_id);
 
     let admin = Address::generate(env);
     let treasury = Address::generate(env);
@@ -96,6 +97,7 @@ fn setup_system_no_auth<'a>(
     )
 }
 
+#[allow(dead_code)]
 fn amount_to_public_input(env: &Env, amount: i128) -> BytesN<32> {
     let mut bytes = [0u8; 32];
     let amount_u128 = amount as u128;
@@ -115,7 +117,7 @@ fn test_execution_with_correct_treasury_context() {
         admin,
         treasury,
         employee,
-        token_id,
+        _token_id,
     ) = setup_system_no_auth(&env);
 
     let proof_a = BytesN::from_array(&env, &[1u8; 64]);
@@ -146,9 +148,19 @@ fn test_execution_with_correct_treasury_context() {
         MockAuth {
             address: &treasury,
             invoke: &MockAuthInvoke {
-                contract: &token_id,
-                fn_name: "transfer",
-                args: (treasury.clone(), employee.clone(), 1000i128).into_val(&env),
+                contract: &executor.address,
+                fn_name: "execute_payment",
+                args: (
+                    company_id,
+                    employee.clone(),
+                    1000i128,
+                    proof_a.clone(),
+                    proof_b.clone(),
+                    proof_c.clone(),
+                    nullifier.clone(),
+                    1u32,
+                )
+                    .into_val(&env),
                 sub_invokes: &[],
             },
         },
