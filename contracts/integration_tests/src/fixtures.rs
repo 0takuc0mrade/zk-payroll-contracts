@@ -6,6 +6,7 @@
 /// All fixtures are deterministic and documented in `docs/fixtures-guide.md`.
 #[cfg(test)]
 #[allow(dead_code, clippy::module_inception)]
+#[allow(dead_code, clippy::module_inception, clippy::bool_assert_comparison)]
 pub mod fixtures {
     use soroban_sdk::{Address, BytesN, Env};
 

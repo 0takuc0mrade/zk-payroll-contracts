@@ -308,7 +308,6 @@ pub enum DataKey {
     CompanyState,
     /// Canonical payroll run state for SDK/dashboard conformance (#159).
     PayrollState(u64),
-    /// Allowed asset for treasury payments.
     /// Allowed asset token for multi-asset treasury management (#175).
     AllowedAsset(Address),
     // Future upgrade example (issue #196):
@@ -397,6 +396,32 @@ impl Payroll {
         }
     }
 
+    fn validate_run_id(run_id: u64) {
+        if run_id == u64::MAX {
+            panic!("Invalid payroll run ID");
+        }
+    }
+
+    fn validate_draft_id(draft_id: u64) {
+        if draft_id == 0 {
+            panic!("Invalid draft ID: must be non-zero");
+        }
+    }
+
+    fn validate_non_zero_digest(e: &Env, digest: &BytesN<32>, _name: &str) {
+        let zero = BytesN::from_array(e, &[0u8; 32]);
+        if digest == &zero {
+            panic!("Digest cannot be all-zero bytes");
+        }
+    }
+
+    fn validate_symbol_not_empty(e: &Env, symbol: &Symbol, _name: &str) {
+        let empty = Symbol::new(e, "");
+        if symbol == &empty {
+            panic!("Symbol cannot be empty");
+        }
+    }
+
     pub fn set_pause_manager(e: Env, pause_manager: Address) {
         let addrs: ContractAddresses = e
             .storage()
@@ -434,6 +459,7 @@ impl Payroll {
 
     pub fn deposit(e: Env, from: Address, amount: i128, deposit_id: BytesN<32>) {
         Self::require_not_paused(&e);
+        Self::validate_non_zero_digest(&e, &deposit_id, "deposit_id");
         if amount <= 0 {
             panic!("Deposit amount must be positive");
         }
@@ -672,6 +698,7 @@ impl Payroll {
     }
 
     pub fn get_payroll_run(e: Env, run_id: u64) -> PayrollRun {
+        Self::validate_run_id(run_id);
         e.storage()
             .persistent()
             .get(&DataKey::PayrollRun(run_id))
@@ -686,6 +713,7 @@ impl Payroll {
     /// by `set_run_metadata` it is removed from storage.
     pub fn commit_metadata_hash(e: Env, admin: Address, metadata_hash: BytesN<32>) {
         Self::require_not_paused(&e);
+        Self::validate_non_zero_digest(&e, &metadata_hash, "metadata_hash");
         let addrs: ContractAddresses = e
             .storage()
             .persistent()
@@ -712,6 +740,8 @@ impl Payroll {
     /// `commit_metadata_hash`. Fails if the hash has not been pre-committed.
     pub fn set_run_metadata(e: Env, admin: Address, run_id: u64, metadata_hash: BytesN<32>) {
         Self::require_not_paused(&e);
+        Self::validate_run_id(run_id);
+        Self::validate_non_zero_digest(&e, &metadata_hash, "metadata_hash");
         let addrs: ContractAddresses = e
             .storage()
             .persistent()
@@ -755,6 +785,7 @@ impl Payroll {
     /// from storage (issue #102).
     pub fn commit_draft(e: Env, admin: Address, draft_hash: BytesN<32>) {
         Self::require_not_paused(&e);
+        Self::validate_non_zero_digest(&e, &draft_hash, "draft_hash");
         let addrs: ContractAddresses = e
             .storage()
             .persistent()
@@ -1010,6 +1041,7 @@ impl Payroll {
     /// and proper state cleanup to prevent cancel-after-submit race conditions.
     pub fn finalize_payroll_run(e: Env, admin: Address, run_id: u64) {
         Self::require_not_paused(&e);
+        Self::validate_run_id(run_id);
         let addrs: ContractAddresses = e
             .storage()
             .persistent()
@@ -1070,8 +1102,9 @@ impl Payroll {
     /// This function serves as a high-priority escape hatch: it deliberately
     /// does NOT require the system to be unpaused. An admin who can pause the
     /// system can also cancel a pending run while paused, enabling rapid
-    /// intervention when a run is discovered to be unsafe.
     pub fn cancel_payroll_run_with_reason(e: Env, admin: Address, run_id: u64, reason: Symbol) {
+        Self::validate_run_id(run_id);
+        Self::validate_symbol_not_empty(&e, &reason, "reason");
         let addrs: ContractAddresses = e
             .storage()
             .persistent()
@@ -1091,20 +1124,20 @@ impl Payroll {
             panic!("Cannot cancel a finalized payroll run");
         }
 
-        let pending_run: PendingPayrollRun = e
+        let _pending_run: PendingPayrollRun = e
             .storage()
             .persistent()
             .get(&pending_key)
             .expect("Pending run not found");
 
-        // Remove the pending run from storage
+        // Remove the pending run from storage if present
         e.storage().persistent().remove(&pending_key);
         Self::record_payroll_run_state(&e, run_id, PayrollRunState::Cancelled);
 
         // Emit cancellation event with reason for audit trail
         e.events().publish(
             (symbol_short!("payroll"), Symbol::new(&e, "run_cancelled")),
-            (run_id, pending_run.total_amount, reason),
+            (run_id, reason),
         );
     }
 
@@ -1117,6 +1150,10 @@ impl Payroll {
         nonce: BytesN<32>,
         draft_hash: Option<BytesN<32>>,
     ) -> u64 {
+        Self::validate_non_zero_digest(&e, &nonce, "nonce");
+        if let Some(ref dh) = draft_hash {
+            Self::validate_non_zero_digest(&e, dh, "draft_hash");
+        }
         let count = proofs.len();
 
         if amounts.len() != count || employees.len() != count {
@@ -1279,6 +1316,7 @@ impl Payroll {
         period_label: Symbol,
     ) -> u64 {
         Self::require_not_paused(&e);
+        Self::validate_symbol_not_empty(&e, &period_label, "period_label");
         let addrs: ContractAddresses = e
             .storage()
             .persistent()
@@ -1334,6 +1372,7 @@ impl Payroll {
         new_employee_count: u32,
     ) {
         Self::require_not_paused(&e);
+        Self::validate_draft_id(draft_id);
         let addrs: ContractAddresses = e
             .storage()
             .persistent()
@@ -1797,6 +1836,7 @@ impl Payroll {
     /// Returns the raw `BytesN<32>` stored in the run record. The zero hash
     /// indicates no metadata has been bound yet.
     pub fn get_metadata_hash(e: Env, run_id: u64) -> BytesN<32> {
+        Self::validate_run_id(run_id);
         let run: PayrollRun = e
             .storage()
             .persistent()
@@ -1818,6 +1858,7 @@ impl Payroll {
     ///     aligns with their locally computed metadata hash.
     ///   - Other contracts can call this for cross-contract verification.
     pub fn verify_metadata_hash(e: Env, run_id: u64, expected_hash: BytesN<32>) -> bool {
+        Self::validate_run_id(run_id);
         let run: PayrollRun = e
             .storage()
             .persistent()
@@ -1867,6 +1908,7 @@ impl Payroll {
     /// flags the run without altering the underlying `PayrollRun` record,
     /// cannot trigger execution, state transitions, or treasury mutations.
     pub fn archive_payroll_run(e: Env, admin: Address, run_id: u64) {
+        Self::validate_run_id(run_id);
         let addrs: ContractAddresses = e
             .storage()
             .persistent()
@@ -1900,6 +1942,7 @@ impl Payroll {
     /// panics for runs that exist but have not been archived, keeping the
     /// archived and active access paths clearly separated.
     pub fn get_archived_run(e: Env, run_id: u64) -> PayrollRun {
+        Self::validate_run_id(run_id);
         if !e.storage().persistent().has(&DataKey::ArchivedRun(run_id)) {
             panic!("Run is not archived");
         }
@@ -1911,6 +1954,7 @@ impl Payroll {
 
     /// Return `true` if the run has been marked as archived, `false` otherwise.
     pub fn is_run_archived(e: Env, run_id: u64) -> bool {
+        Self::validate_run_id(run_id);
         e.storage().persistent().has(&DataKey::ArchivedRun(run_id))
     }
 
