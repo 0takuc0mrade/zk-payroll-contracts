@@ -96,6 +96,7 @@ fn setup_system_no_auth<'a>(
     )
 }
 
+#[allow(dead_code)]
 fn amount_to_public_input(env: &Env, amount: i128) -> BytesN<32> {
     let mut bytes = [0u8; 32];
     let amount_u128 = amount as u128;
