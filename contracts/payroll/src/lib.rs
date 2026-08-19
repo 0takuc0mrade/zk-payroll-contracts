@@ -3182,7 +3182,11 @@ mod tests {
             PayrollRunState::Submitted
         );
 
-        payroll_client.cancel_payroll_run(&admin, &run_id, &Symbol::new(&env, "CANCEL"));
+        payroll_client.cancel_payroll_run_with_reason(
+            &admin,
+            &run_id,
+            &Symbol::new(&env, "CANCEL"),
+        );
         assert_eq!(
             payroll_client.get_payroll_run_state(&run_id),
             PayrollRunState::Cancelled
@@ -3204,7 +3208,11 @@ mod tests {
             &test_nonce(&env, 151),
             &None,
         );
-        payroll_client.cancel_payroll_run(&admin, &run_id, &Symbol::new(&env, "CANCEL"));
+        payroll_client.cancel_payroll_run_with_reason(
+            &admin,
+            &run_id,
+            &Symbol::new(&env, "CANCEL"),
+        );
 
         let result = payroll_client.try_transition_payroll_run_state(
             &admin,
@@ -3280,7 +3288,11 @@ mod tests {
         );
 
         // Cancel the pending run
-        payroll_client.cancel_payroll_run(&admin, &run_id, &Symbol::new(&env, "CANCEL"));
+        payroll_client.cancel_payroll_run_with_reason(
+            &admin,
+            &run_id,
+            &Symbol::new(&env, "CANCEL"),
+        );
 
         // Verify it's no longer pending
         assert!(payroll_client.get_pending_run(&run_id).is_none());
@@ -3736,7 +3748,8 @@ mod tests {
         // Failed cancel (wrong caller) should not affect the pending run
         let attacker = Address::generate(&env);
         let reason = Symbol::new(&env, "attack");
-        let cancel_result = payroll_client.try_cancel_payroll_run_with_reason(&attacker, &run_id, &reason);
+        let cancel_result =
+            payroll_client.try_cancel_payroll_run_with_reason(&attacker, &run_id, &reason);
         assert!(cancel_result.is_err());
 
         // Pending run should still exist

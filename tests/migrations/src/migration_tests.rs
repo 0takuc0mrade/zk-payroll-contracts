@@ -459,7 +459,6 @@ mod migration_tests {
         let _ = executor_client.close_period(&ctx.company_id_2, &1);
 
         // New periods can be created post-migration
-        executor_client.close_period(&ctx.company_id_2, &1);
         let new_p = executor_client.create_period(&ctx.company_id_2);
         assert_eq!(new_p.period_id, 2, "Period sequence must continue");
         assert_eq!(new_p.company_id, ctx.company_id_2);

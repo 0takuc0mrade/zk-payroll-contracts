@@ -33,7 +33,12 @@ fn setup_system(
 
     let token_id = env.register_contract(None, Token);
     let token_client = TokenClient::new(env, &token_id);
-    token_client.initialize(&admin, &7, &String::from_str(env, "USD Dollar"), &String::from_str(env, "USDC"));
+    token_client.initialize(
+        &admin,
+        &7,
+        &String::from_str(env, "USD Dollar"),
+        &String::from_str(env, "USDC"),
+    );
     token_client.mint(&treasury, &1_000_000);
 
     let pause_manager_id = env.register_contract(None, PauseManager);
@@ -355,14 +360,8 @@ fn test_metadata_validation_preserves_privacy() {
     let meta_hash = valid_hash(&env, 0x88);
 
     payroll.commit_metadata_hash(&admin, &meta_hash);
-    let run_id = payroll.batch_process_payroll(
-        &proofs,
-        &amounts,
-        &employees,
-        &50_000i128,
-        &nonce,
-        &None,
-    );
+    let run_id =
+        payroll.batch_process_payroll(&proofs, &amounts, &employees, &50_000i128, &nonce, &None);
     payroll.set_run_metadata(&admin, &run_id, &meta_hash);
 
     let run = payroll.get_payroll_run(&run_id);

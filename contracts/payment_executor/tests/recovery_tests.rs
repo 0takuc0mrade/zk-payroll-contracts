@@ -573,7 +573,7 @@ fn test_partial_batch_failure_individual_retry_completes_payroll() {
         executor.is_paid(&emp3, &1),
         "emp3 must succeed after individual recovery"
     );
-    assert_eq!(executor.get_total_paid(&company_id), 400 + 200);
+    assert_eq!(executor.get_total_paid(&company_id), 400 + 100 + 200);
 }
 
 // ===========================================================================
