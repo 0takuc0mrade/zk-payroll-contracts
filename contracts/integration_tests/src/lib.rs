@@ -274,6 +274,27 @@ mod e2e {
         assert!(has_commitment, "CommitmentUpdated event missing");
         assert!(has_employee, "EmployeeAdded event missing");
         assert!(has_payment, "payment_executed event missing");
+        assert!(events.len() >= 6, "Expected at least 6 events emitted");
+
+        let has_event = |sym: &str| {
+            events.iter().any(|e| {
+                e.1.iter().any(|val| {
+                    if let Ok(s) = val.try_into_val(env) {
+                        let symbol: Symbol = s;
+                        symbol == Symbol::new(env, sym)
+                    } else {
+                        false
+                    }
+                })
+            })
+        };
+
+        assert!(has_event("CompanyRegistered"), "CompanyRegistered event must be emitted");
+        assert!(has_event("CommitmentUpdated"), "CommitmentUpdated event must be emitted");
+        assert!(has_event("EmployeeAdded"), "EmployeeAdded event must be emitted");
+        assert!(has_event("CommitmentLocked"), "CommitmentLocked event must be emitted");
+        assert!(has_event("payment_executed"), "payment_executed event must be emitted");
+        assert!(has_event("run_executed"), "run_executed event must be emitted");
     }
 
     /// Paying an employee who has no commitment on-chain must panic.
