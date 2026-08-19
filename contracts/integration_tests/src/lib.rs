@@ -257,12 +257,30 @@ mod e2e {
             })
         };
 
-        assert!(has_event("CompanyRegistered"), "CompanyRegistered event must be emitted");
-        assert!(has_event("CommitmentUpdated"), "CommitmentUpdated event must be emitted");
-        assert!(has_event("EmployeeAdded"), "EmployeeAdded event must be emitted");
-        assert!(has_event("CommitmentLocked"), "CommitmentLocked event must be emitted");
-        assert!(has_event("payment_executed"), "payment_executed event must be emitted");
-        assert!(has_event("run_executed"), "run_executed event must be emitted");
+        assert!(
+            has_event("CompanyRegistered"),
+            "CompanyRegistered event must be emitted"
+        );
+        assert!(
+            has_event("CommitmentUpdated"),
+            "CommitmentUpdated event must be emitted"
+        );
+        assert!(
+            has_event("EmployeeAdded"),
+            "EmployeeAdded event must be emitted"
+        );
+        assert!(
+            has_event("CommitmentLocked"),
+            "CommitmentLocked event must be emitted"
+        );
+        assert!(
+            has_event("payment_executed"),
+            "payment_executed event must be emitted"
+        );
+        assert!(
+            has_event("run_executed"),
+            "run_executed event must be emitted"
+        );
     }
 
     /// Paying an employee who has no commitment on-chain must panic.

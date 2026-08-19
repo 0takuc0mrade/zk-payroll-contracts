@@ -2,7 +2,6 @@
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, token as soroban_token, Address, BytesN,
     Env, Symbol, Vec,
-    contract, contractimpl, contracttype, symbol_short, token as soroban_token, Address, BytesN, Env, Symbol, Vec,
 };
 
 use pause_manager::PauseManagerClient;
@@ -3692,7 +3691,8 @@ mod tests {
         // Failed cancel (wrong caller) should not affect the pending run
         let attacker = Address::generate(&env);
         let reason = Symbol::new(&env, "attack");
-        let cancel_result = payroll_client.try_cancel_payroll_run_with_reason(&attacker, &run_id, &reason);
+        let cancel_result =
+            payroll_client.try_cancel_payroll_run_with_reason(&attacker, &run_id, &reason);
         assert!(cancel_result.is_err());
 
         // Pending run should still exist
