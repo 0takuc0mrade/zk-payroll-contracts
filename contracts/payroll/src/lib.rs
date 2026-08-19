@@ -153,6 +153,29 @@ pub struct PayrollRunDraft {
     pub amendment_count: u32,
 }
 
+// ── Reviewer Authorization & Run Review ─────────────────────────────────────
+
+/// Review decision outcome for a payroll run.
+#[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum ReviewDecision {
+    Approved = 0,
+    Rejected = 1,
+    ChangesRequested = 2,
+}
+
+/// A review record submitted by an authorized reviewer.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct RunReview {
+    pub run_id: u64,
+    pub reviewer: Address,
+    pub decision: ReviewDecision,
+    pub reason: Symbol,
+    pub reviewed_at: u64,
+}
+
 // ── Issue #91: privileged-role rotation ──────────────────────────────────────
 
 /// Pending two-step role-rotation request.
@@ -308,8 +331,12 @@ pub enum DataKey {
     CompanyState,
     /// Canonical payroll run state for SDK/dashboard conformance (#159).
     PayrollState(u64),
-    /// Allowed asset token for multi-asset treasury management (#175).
+    /// Allowed asset token map for payroll payouts.
     AllowedAsset(Address),
+    /// Authorized reviewer registration for payroll run reviews.
+    AuthorizedReviewer(Address),
+    /// Review record for a payroll run.
+    RunReview(u64),
     // Future upgrade example (issue #196):
     // PayrollRunV2(u64),  // Would be added here when schema evolution is needed
 }
@@ -1141,6 +1168,11 @@ impl Payroll {
         );
     }
 
+    /// Alias for cancel_payroll_run_with_reason
+    pub fn cancel_payroll_run(e: Env, admin: Address, run_id: u64, reason: Symbol) {
+        Self::cancel_payroll_run_with_reason(e, admin, run_id, reason);
+    }
+
     pub fn batch_process_payroll(
         e: Env,
         proofs: Vec<BytesN<256>>,
@@ -1958,6 +1990,126 @@ impl Payroll {
         e.storage().persistent().has(&DataKey::ArchivedRun(run_id))
     }
 
+    // ── Reviewer Authorization & Run Review Entrypoints ─────────────────────
+
+    /// Grant reviewer authorization to an address. Only the admin may call.
+    pub fn add_reviewer(e: Env, admin: Address, reviewer: Address) {
+        Self::require_not_paused(&e);
+        let addrs: ContractAddresses = e
+            .storage()
+            .persistent()
+            .get(&DataKey::Addresses)
+            .expect("Not initialized");
+        if admin != addrs.admin {
+            panic!("Unauthorized");
+        }
+        admin.require_auth();
+
+        e.storage()
+            .persistent()
+            .set(&DataKey::AuthorizedReviewer(reviewer.clone()), &true);
+
+        payroll_events::emit_reviewer_added(&e, reviewer);
+    }
+
+    /// Revoke reviewer authorization from an address. Only the admin may call.
+    pub fn remove_reviewer(e: Env, admin: Address, reviewer: Address) {
+        Self::require_not_paused(&e);
+        let addrs: ContractAddresses = e
+            .storage()
+            .persistent()
+            .get(&DataKey::Addresses)
+            .expect("Not initialized");
+        if admin != addrs.admin {
+            panic!("Unauthorized");
+        }
+        admin.require_auth();
+
+        e.storage()
+            .persistent()
+            .remove(&DataKey::AuthorizedReviewer(reviewer.clone()));
+
+        payroll_events::emit_reviewer_removed(&e, reviewer);
+    }
+
+    /// Return `true` if the address is an authorized reviewer, `false` otherwise.
+    pub fn is_reviewer(e: Env, reviewer: Address) -> bool {
+        e.storage()
+            .persistent()
+            .get(&DataKey::AuthorizedReviewer(reviewer))
+            .unwrap_or(false)
+    }
+
+    /// Approve a payroll run as an authorized reviewer.
+    pub fn approve_payroll_run(e: Env, reviewer: Address, run_id: u64) {
+        Self::require_not_paused(&e);
+        if !Self::is_reviewer(e.clone(), reviewer.clone()) {
+            panic!("Unauthorized: caller is not an authorized reviewer");
+        }
+        reviewer.require_auth();
+
+        let review = RunReview {
+            run_id,
+            reviewer: reviewer.clone(),
+            decision: ReviewDecision::Approved,
+            reason: Symbol::new(&e, "approved"),
+            reviewed_at: e.ledger().timestamp(),
+        };
+        e.storage()
+            .persistent()
+            .set(&DataKey::RunReview(run_id), &review);
+
+        payroll_events::emit_run_approved(&e, run_id, reviewer);
+    }
+
+    /// Reject a payroll run as an authorized reviewer.
+    pub fn reject_payroll_run(e: Env, reviewer: Address, run_id: u64, reason: Symbol) {
+        Self::require_not_paused(&e);
+        if !Self::is_reviewer(e.clone(), reviewer.clone()) {
+            panic!("Unauthorized: caller is not an authorized reviewer");
+        }
+        reviewer.require_auth();
+
+        let review = RunReview {
+            run_id,
+            reviewer: reviewer.clone(),
+            decision: ReviewDecision::Rejected,
+            reason: reason.clone(),
+            reviewed_at: e.ledger().timestamp(),
+        };
+        e.storage()
+            .persistent()
+            .set(&DataKey::RunReview(run_id), &review);
+
+        payroll_events::emit_run_rejected(&e, run_id, reviewer, reason);
+    }
+
+    /// Request changes to a payroll run as an authorized reviewer.
+    pub fn request_changes_payroll_run(e: Env, reviewer: Address, run_id: u64, reason: Symbol) {
+        Self::require_not_paused(&e);
+        if !Self::is_reviewer(e.clone(), reviewer.clone()) {
+            panic!("Unauthorized: caller is not an authorized reviewer");
+        }
+        reviewer.require_auth();
+
+        let review = RunReview {
+            run_id,
+            reviewer: reviewer.clone(),
+            decision: ReviewDecision::ChangesRequested,
+            reason: reason.clone(),
+            reviewed_at: e.ledger().timestamp(),
+        };
+        e.storage()
+            .persistent()
+            .set(&DataKey::RunReview(run_id), &review);
+
+        payroll_events::emit_run_changes_requested(&e, run_id, reviewer, reason);
+    }
+
+    /// Get the review record for a payroll run, if any.
+    pub fn get_run_review(e: Env, run_id: u64) -> Option<RunReview> {
+        e.storage().persistent().get(&DataKey::RunReview(run_id))
+    }
     /// Read contract dependency addresses configured during initialization.
     pub fn get_addresses(e: Env) -> ContractAddresses {
         e.storage()
@@ -4200,5 +4352,86 @@ mod tests {
             },
         }]);
         payroll_client.set_asset_allowed(&token_id, &false);
+    }
+
+    // ── Reviewer Authorization & Run Review Tests ────────────────────────────
+
+    #[test]
+    fn test_reviewer_authorization_workflow() {
+        let env = Env::default();
+        let (payroll_client, admin, _treasury, _treasury_owner, employee) =
+            setup_simple_payroll(&env);
+
+        let reviewer = Address::generate(&env);
+
+        // Initial state: not reviewer
+        assert!(!payroll_client.is_reviewer(&reviewer));
+
+        // Admin adds reviewer
+        payroll_client.add_reviewer(&admin, &reviewer);
+        assert!(payroll_client.is_reviewer(&reviewer));
+
+        // Prepare run
+        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
+        let run_id = payroll_client.prepare_payroll_run(
+            &proofs,
+            &amounts,
+            &employees,
+            &1000,
+            &test_nonce(&env, 99),
+            &None,
+        );
+
+        // Reviewer approves run
+        payroll_client.approve_payroll_run(&reviewer, &run_id);
+        let review = payroll_client
+            .get_run_review(&run_id)
+            .expect("Review record missing");
+        assert_eq!(review.run_id, run_id);
+        assert_eq!(review.reviewer, reviewer);
+        assert_eq!(review.decision, ReviewDecision::Approved);
+
+        // Reviewer requests changes
+        let reason_changes = Symbol::new(&env, "need_docs");
+        payroll_client.request_changes_payroll_run(&reviewer, &run_id, &reason_changes);
+        let review2 = payroll_client
+            .get_run_review(&run_id)
+            .expect("Review record missing");
+        assert_eq!(review2.decision, ReviewDecision::ChangesRequested);
+        assert_eq!(review2.reason, reason_changes);
+
+        // Reviewer rejects run
+        let reason_reject = Symbol::new(&env, "invalid");
+        payroll_client.reject_payroll_run(&reviewer, &run_id, &reason_reject);
+        let review3 = payroll_client
+            .get_run_review(&run_id)
+            .expect("Review record missing");
+        assert_eq!(review3.decision, ReviewDecision::Rejected);
+        assert_eq!(review3.reason, reason_reject);
+
+        // Admin revokes reviewer
+        payroll_client.remove_reviewer(&admin, &reviewer);
+        assert!(!payroll_client.is_reviewer(&reviewer));
+    }
+
+    #[test]
+    #[should_panic(expected = "Unauthorized: caller is not an authorized reviewer")]
+    fn test_unauthorized_approve_panics() {
+        let env = Env::default();
+        let (payroll_client, _admin, _treasury, _treasury_owner, employee) =
+            setup_simple_payroll(&env);
+
+        let unauthorized = Address::generate(&env);
+        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
+        let run_id = payroll_client.prepare_payroll_run(
+            &proofs,
+            &amounts,
+            &employees,
+            &1000,
+            &test_nonce(&env, 100),
+            &None,
+        );
+
+        payroll_client.approve_payroll_run(&unauthorized, &run_id);
     }
 }
