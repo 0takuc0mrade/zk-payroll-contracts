@@ -1095,7 +1095,7 @@ impl Payroll {
 
         // Remove the pending run from storage
         e.storage().persistent().remove(&pending_key);
-        Self::record_payroll_run_state(&e, run_id, PayrollRunState::Cancelled);
+        Self::record_payroll_run_state(&e, run_id, PayrollRunState::ReconciliationRequired);
 
         let run = PayrollRun {
             run_id,
@@ -3630,6 +3630,41 @@ mod tests {
         payroll_client.cancel_payroll_run_with_reason(&admin, &run_id, &reason);
 
         assert!(payroll_client.get_pending_run(&run_id).is_none());
+        assert_eq!(
+            payroll_client.get_payroll_run_state(&run_id),
+            PayrollRunState::Cancelled
+        );
+    }
+
+    #[test]
+    fn test_finalize_payroll_run_records_reconciliation_required_and_cleans_pending() {
+        let env = Env::default();
+        let (payroll_client, admin, _treasury, _treasury_owner, employee) =
+            setup_simple_payroll(&env);
+
+        let nonce = test_nonce(&env, 46);
+        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
+        let run_id =
+            payroll_client.prepare_payroll_run(&proofs, &amounts, &employees, &1000, &nonce, &None);
+
+        assert!(payroll_client.get_pending_run(&run_id).is_some());
+        assert_eq!(
+            payroll_client.get_payroll_run_state(&run_id),
+            PayrollRunState::Submitted
+        );
+
+        payroll_client.finalize_payroll_run(&admin, &run_id);
+
+        assert!(payroll_client.get_pending_run(&run_id).is_none());
+        assert_eq!(
+            payroll_client.get_payroll_run_state(&run_id),
+            PayrollRunState::ReconciliationRequired
+        );
+        let run = payroll_client.get_payroll_run(&run_id);
+        assert_eq!(
+            run.reconciliation_status,
+            ReconciliationStatus::Unreconciled
+        );
     }
 
     #[test]
