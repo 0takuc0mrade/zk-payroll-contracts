@@ -148,6 +148,52 @@ pub fn emit_run_executed(e: &Env, run_id: u64, total_spend: i128) {
     );
 }
 
+/// Emitted when a long-running payroll batch starts checkpointing.
+pub fn emit_batch_checkpoint_started(
+    e: &Env,
+    employer: Address,
+    batch_root: BytesN<32>,
+    asset: Address,
+    execution_nonce: BytesN<32>,
+    checkpoint_index: u32,
+) {
+    e.events().publish(
+        (payroll_topic(), Symbol::new(e, "batch_checkpoint_started")),
+        (employer, batch_root, asset, execution_nonce, checkpoint_index),
+    );
+}
+
+/// Emitted when a payroll batch checkpoint advances without exposing salary rows.
+pub fn emit_batch_checkpoint_updated(
+    e: &Env,
+    employer: Address,
+    batch_root: BytesN<32>,
+    asset: Address,
+    execution_nonce: BytesN<32>,
+    checkpoint_index: u32,
+    state: u32,
+) {
+    e.events().publish(
+        (payroll_topic(), Symbol::new(e, "batch_checkpoint_updated")),
+        (employer, batch_root, asset, execution_nonce, checkpoint_index, state),
+    );
+}
+
+/// Emitted when a batch checkpoint is resumed after an interruption.
+pub fn emit_batch_checkpoint_resumed(
+    e: &Env,
+    employer: Address,
+    batch_root: BytesN<32>,
+    asset: Address,
+    execution_nonce: BytesN<32>,
+    checkpoint_index: u32,
+) {
+    e.events().publish(
+        (payroll_topic(), Symbol::new(e, "batch_checkpoint_resumed")),
+        (employer, batch_root, asset, execution_nonce, checkpoint_index),
+    );
+}
+
 /// Emitted when a payroll run draft is created.
 pub fn emit_draft_created(e: &Env, draft_id: u64, admin: Address, period_label: Symbol) {
     e.events().publish(
