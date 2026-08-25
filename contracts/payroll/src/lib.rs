@@ -118,6 +118,37 @@ pub struct EmergencyWithdrawalRequest {
     pub approved: bool,
 }
 
+/// Lifecycle state for a long-running payroll batch execution checkpoint.
+#[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum BatchCheckpointState {
+    Started = 0,
+    PartiallyCheckpointed = 1,
+    Resumed = 2,
+    Completed = 3,
+    Failed = 4,
+}
+
+/// A privacy-safe checkpoint for an interrupted payroll batch.
+///
+/// The checkpoint key is derived from employer + batch root + asset + execution
+/// nonce so that retries are deterministic and replay-resistant while avoiding
+/// disclosure of employee salary rows in the event payload.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct BatchCheckpoint {
+    pub employer: Address,
+    pub batch_root: BytesN<32>,
+    pub asset: Address,
+    pub execution_nonce: BytesN<32>,
+    pub state: BatchCheckpointState,
+    pub last_checkpoint_index: u32,
+    pub total_checkpoints: u32,
+    pub completed: bool,
+    pub failed: bool,
+}
+
 // ── Issue #89: payroll amendment flow ────────────────────────────────────────
 
 /// Lifecycle state of a payroll run draft.
@@ -333,6 +364,8 @@ pub enum DataKey {
     PayrollState(u64),
     /// Allowed asset token map for payroll payouts.
     AllowedAsset(Address),
+    /// Checkpointed payroll batch execution keyed by a privacy-safe tuple.
+    BatchCheckpoint(Address, BytesN<32>, Address, BytesN<32>),
     /// Authorized reviewer registration for payroll run reviews.
     AuthorizedReviewer(Address),
     /// Review record for a payroll run.
@@ -691,6 +724,193 @@ impl Payroll {
     /// Return whether a state should expose a retry action to clients.
     pub fn is_payroll_state_retryable(_e: Env, state: PayrollRunState) -> bool {
         Self::is_retryable_payroll_state_internal(state)
+    }
+
+    pub fn begin_batch_execution_checkpoint(
+        e: Env,
+        admin: Address,
+        employer: Address,
+        batch_root: BytesN<32>,
+        asset: Address,
+        execution_nonce: BytesN<32>,
+        checkpoint_index: u32,
+    ) {
+        Self::validate_non_zero_digest(&e, &batch_root, "batch_root");
+        Self::validate_non_zero_digest(&e, &execution_nonce, "execution_nonce");
+        let addrs: ContractAddresses = e
+            .storage()
+            .persistent()
+            .get(&DataKey::Addresses)
+            .expect("Not initialized");
+        if admin != addrs.admin {
+            panic!("Unauthorized");
+        }
+        admin.require_auth();
+
+        let key = DataKey::BatchCheckpoint(
+            employer.clone(),
+            batch_root.clone(),
+            asset.clone(),
+            execution_nonce.clone(),
+        );
+        if e.storage().persistent().has(&key) {
+            panic!("Batch execution checkpoint already exists");
+        }
+
+        let checkpoint = BatchCheckpoint {
+            employer: employer.clone(),
+            batch_root: batch_root.clone(),
+            asset: asset.clone(),
+            execution_nonce: execution_nonce.clone(),
+            state: BatchCheckpointState::Started,
+            last_checkpoint_index: checkpoint_index,
+            total_checkpoints: 1,
+            completed: false,
+            failed: false,
+        };
+        e.storage().persistent().set(&key, &checkpoint);
+        payroll_events::emit_batch_checkpoint_started(
+            &e,
+            employer,
+            batch_root,
+            asset,
+            execution_nonce,
+            checkpoint_index,
+        );
+    }
+
+    pub fn record_batch_checkpoint_progress(
+        e: Env,
+        admin: Address,
+        employer: Address,
+        batch_root: BytesN<32>,
+        asset: Address,
+        execution_nonce: BytesN<32>,
+        checkpoint_index: u32,
+        state: BatchCheckpointState,
+    ) {
+        let addrs: ContractAddresses = e
+            .storage()
+            .persistent()
+            .get(&DataKey::Addresses)
+            .expect("Not initialized");
+        if admin != addrs.admin {
+            panic!("Unauthorized");
+        }
+        admin.require_auth();
+
+        let key = DataKey::BatchCheckpoint(
+            employer.clone(),
+            batch_root.clone(),
+            asset.clone(),
+            execution_nonce.clone(),
+        );
+        let mut checkpoint: BatchCheckpoint = e
+            .storage()
+            .persistent()
+            .get(&key)
+            .expect("Batch execution checkpoint not found");
+
+        if checkpoint.employer != employer
+            || checkpoint.batch_root != batch_root
+            || checkpoint.asset != asset
+            || checkpoint.execution_nonce != execution_nonce
+        {
+            panic!("ERR_BATCH_CHECKPOINT_MISMATCH");
+        }
+
+        checkpoint.last_checkpoint_index = checkpoint_index;
+        checkpoint.state = state;
+        checkpoint.total_checkpoints = checkpoint.total_checkpoints.max(1);
+        checkpoint.completed = matches!(state, BatchCheckpointState::Completed);
+        checkpoint.failed = matches!(state, BatchCheckpointState::Failed);
+        e.storage().persistent().set(&key, &checkpoint);
+
+        payroll_events::emit_batch_checkpoint_updated(
+            &e,
+            employer,
+            batch_root,
+            asset,
+            execution_nonce,
+            checkpoint_index,
+            state as u32,
+        );
+    }
+
+    pub fn get_batch_execution_checkpoint(
+        e: Env,
+        employer: Address,
+        batch_root: BytesN<32>,
+        asset: Address,
+        execution_nonce: BytesN<32>,
+    ) -> BatchCheckpoint {
+        let key = DataKey::BatchCheckpoint(
+            employer,
+            batch_root,
+            asset,
+            execution_nonce,
+        );
+        e.storage()
+            .persistent()
+            .get(&key)
+            .expect("Batch execution checkpoint not found")
+    }
+
+    pub fn resume_batch_execution(
+        e: Env,
+        admin: Address,
+        employer: Address,
+        batch_root: BytesN<32>,
+        asset: Address,
+        execution_nonce: BytesN<32>,
+        checkpoint_index: u32,
+    ) -> bool {
+        let addrs: ContractAddresses = e
+            .storage()
+            .persistent()
+            .get(&DataKey::Addresses)
+            .expect("Not initialized");
+        if admin != addrs.admin {
+            panic!("Unauthorized");
+        }
+        admin.require_auth();
+
+        let key = DataKey::BatchCheckpoint(
+            employer.clone(),
+            batch_root.clone(),
+            asset.clone(),
+            execution_nonce.clone(),
+        );
+        let mut checkpoint: BatchCheckpoint = e
+            .storage()
+            .persistent()
+            .get(&key)
+            .expect("Batch execution checkpoint not found");
+
+        if checkpoint.employer != employer
+            || checkpoint.batch_root != batch_root
+            || checkpoint.asset != asset
+            || checkpoint.execution_nonce != execution_nonce
+            || checkpoint_index != checkpoint.last_checkpoint_index
+            || checkpoint.completed
+            || checkpoint.failed
+        {
+            panic!("ERR_BATCH_CHECKPOINT_MISMATCH");
+        }
+
+        checkpoint.state = BatchCheckpointState::Resumed;
+        checkpoint.last_checkpoint_index = checkpoint_index;
+        e.storage().persistent().set(&key, &checkpoint);
+
+        payroll_events::emit_batch_checkpoint_resumed(
+            &e,
+            employer,
+            batch_root,
+            asset,
+            execution_nonce,
+            checkpoint_index,
+        );
+        true
     }
 
     /// Return the canonical state for a payroll run ID.
@@ -4468,5 +4688,167 @@ mod tests {
         );
 
         payroll_client.approve_payroll_run(&unauthorized, &run_id);
+    }
+
+    #[test]
+    fn test_batch_checkpoint_resume_flow() {
+        let env = Env::default();
+        let (payroll_client, admin, _treasury, _treasury_owner, _employee) =
+            setup_simple_payroll(&env);
+
+        let employer = Address::generate(&env);
+        let asset = Address::generate(&env);
+        let batch_root = BytesN::from_array(&env, &[0x11u8; 32]);
+        let execution_nonce = BytesN::from_array(&env, &[0x22u8; 32]);
+
+        payroll_client.begin_batch_execution_checkpoint(
+            &admin,
+            &employer,
+            &batch_root,
+            &asset,
+            &execution_nonce,
+            &10u32,
+        );
+
+        let checkpoint = payroll_client.get_batch_execution_checkpoint(
+            &employer,
+            &batch_root,
+            &asset,
+            &execution_nonce,
+        );
+        assert_eq!(checkpoint.state, BatchCheckpointState::Started);
+        assert!(!checkpoint.completed);
+
+        payroll_client.record_batch_checkpoint_progress(
+            &admin,
+            &employer,
+            &batch_root,
+            &asset,
+            &execution_nonce,
+            &5u32,
+            &BatchCheckpointState::PartiallyCheckpointed,
+        );
+
+        let resumed = payroll_client.resume_batch_execution(
+            &admin,
+            &employer,
+            &batch_root,
+            &asset,
+            &execution_nonce,
+            &5u32,
+        );
+        assert!(resumed);
+
+        let checkpoint_after = payroll_client.get_batch_execution_checkpoint(
+            &employer,
+            &batch_root,
+            &asset,
+            &execution_nonce,
+        );
+        assert_eq!(checkpoint_after.state, BatchCheckpointState::Resumed);
+        assert_eq!(checkpoint_after.last_checkpoint_index, 5u32);
+    }
+
+    #[test]
+    fn test_batch_checkpoint_replay_is_rejected() {
+        let env = Env::default();
+        let (payroll_client, admin, _treasury, _treasury_owner, _employee) =
+            setup_simple_payroll(&env);
+
+        let employer = Address::generate(&env);
+        let asset = Address::generate(&env);
+        let batch_root = BytesN::from_array(&env, &[0x33u8; 32]);
+        let execution_nonce = BytesN::from_array(&env, &[0x44u8; 32]);
+
+        payroll_client.begin_batch_execution_checkpoint(
+            &admin,
+            &employer,
+            &batch_root,
+            &asset,
+            &execution_nonce,
+            &3u32,
+        );
+
+        let result = payroll_client.try_resume_batch_execution(
+            &admin,
+            &employer,
+            &batch_root,
+            &asset,
+            &execution_nonce,
+            &0u32,
+        );
+        assert!(result.is_err());
+
+        let checkpoint = payroll_client.get_batch_execution_checkpoint(
+            &employer,
+            &batch_root,
+            &asset,
+            &execution_nonce,
+        );
+        assert_eq!(checkpoint.state, BatchCheckpointState::Started);
+    }
+
+    #[test]
+    #[should_panic(expected = "Unauthorized")]
+    fn test_batch_checkpoint_resume_rejects_unauthorized_caller() {
+        let env = Env::default();
+        let (payroll_client, admin, _treasury, _treasury_owner, _employee) =
+            setup_simple_payroll(&env);
+
+        let employer = Address::generate(&env);
+        let asset = Address::generate(&env);
+        let batch_root = BytesN::from_array(&env, &[0x55u8; 32]);
+        let execution_nonce = BytesN::from_array(&env, &[0x66u8; 32]);
+
+        payroll_client.begin_batch_execution_checkpoint(
+            &admin,
+            &employer,
+            &batch_root,
+            &asset,
+            &execution_nonce,
+            &4u32,
+        );
+
+        let attacker = Address::generate(&env);
+        payroll_client.resume_batch_execution(
+            &attacker,
+            &employer,
+            &batch_root,
+            &asset,
+            &execution_nonce,
+            &4u32,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "ERR_BATCH_CHECKPOINT_MISMATCH")]
+    fn test_batch_checkpoint_rejects_mismatched_resume_inputs() {
+        let env = Env::default();
+        let (payroll_client, admin, _treasury, _treasury_owner, _employee) =
+            setup_simple_payroll(&env);
+
+        let employer = Address::generate(&env);
+        let asset = Address::generate(&env);
+        let batch_root = BytesN::from_array(&env, &[0x77u8; 32]);
+        let execution_nonce = BytesN::from_array(&env, &[0x88u8; 32]);
+
+        payroll_client.begin_batch_execution_checkpoint(
+            &admin,
+            &employer,
+            &batch_root,
+            &asset,
+            &execution_nonce,
+            &7u32,
+        );
+
+        let wrong_asset = Address::generate(&env);
+        payroll_client.resume_batch_execution(
+            &admin,
+            &employer,
+            &batch_root,
+            &wrong_asset,
+            &execution_nonce,
+            &7u32,
+        );
     }
 }
