@@ -809,7 +809,7 @@ impl Payroll {
             .storage()
             .persistent()
             .get(&key)
-            .expect("Batch execution checkpoint not found");
+            .unwrap_or_else(|| panic!("ERR_BATCH_CHECKPOINT_MISMATCH"));
 
         if checkpoint.employer != employer
             || checkpoint.batch_root != batch_root
@@ -819,9 +819,20 @@ impl Payroll {
             panic!("ERR_BATCH_CHECKPOINT_MISMATCH");
         }
 
+        if checkpoint.completed
+            || checkpoint.failed
+            || checkpoint_index < checkpoint.last_checkpoint_index
+            || matches!(state, BatchCheckpointState::Started | BatchCheckpointState::Resumed)
+        {
+            panic!("ERR_BATCH_CHECKPOINT_MISMATCH");
+        }
+
         checkpoint.last_checkpoint_index = checkpoint_index;
         checkpoint.state = state;
-        checkpoint.total_checkpoints = checkpoint.total_checkpoints.max(1);
+        checkpoint.total_checkpoints = checkpoint
+            .total_checkpoints
+            .checked_add(1)
+            .unwrap_or_else(|| panic!("ERR_BATCH_CHECKPOINT_MISMATCH"));
         checkpoint.completed = matches!(state, BatchCheckpointState::Completed);
         checkpoint.failed = matches!(state, BatchCheckpointState::Failed);
         e.storage().persistent().set(&key, &checkpoint);
@@ -865,6 +876,8 @@ impl Payroll {
         execution_nonce: BytesN<32>,
         checkpoint_index: u32,
     ) -> bool {
+        Self::validate_non_zero_digest(&e, &batch_root, "batch_root");
+        Self::validate_non_zero_digest(&e, &execution_nonce, "execution_nonce");
         let addrs: ContractAddresses = e
             .storage()
             .persistent()
@@ -885,13 +898,19 @@ impl Payroll {
             .storage()
             .persistent()
             .get(&key)
-            .expect("Batch execution checkpoint not found");
+            .unwrap_or_else(|| panic!("ERR_BATCH_CHECKPOINT_MISMATCH"));
 
         if checkpoint.employer != employer
             || checkpoint.batch_root != batch_root
             || checkpoint.asset != asset
             || checkpoint.execution_nonce != execution_nonce
             || checkpoint_index != checkpoint.last_checkpoint_index
+            || matches!(
+                checkpoint.state,
+                BatchCheckpointState::Resumed
+                    | BatchCheckpointState::Completed
+                    | BatchCheckpointState::Failed
+            )
             || checkpoint.completed
             || checkpoint.failed
         {
@@ -4707,7 +4726,7 @@ mod tests {
             &batch_root,
             &asset,
             &execution_nonce,
-            &10u32,
+            &0u32,
         );
 
         let checkpoint = payroll_client.get_batch_execution_checkpoint(
@@ -4747,6 +4766,38 @@ mod tests {
         );
         assert_eq!(checkpoint_after.state, BatchCheckpointState::Resumed);
         assert_eq!(checkpoint_after.last_checkpoint_index, 5u32);
+        assert_eq!(checkpoint_after.total_checkpoints, 2u32);
+    }
+
+    #[test]
+    #[should_panic(expected = "ERR_BATCH_CHECKPOINT_MISMATCH")]
+    fn test_batch_checkpoint_rejects_backward_progress() {
+        let env = Env::default();
+        let (payroll_client, admin, _treasury, _treasury_owner, _employee) =
+            setup_simple_payroll(&env);
+
+        let employer = Address::generate(&env);
+        let asset = Address::generate(&env);
+        let batch_root = BytesN::from_array(&env, &[0x99u8; 32]);
+        let execution_nonce = BytesN::from_array(&env, &[0xaau8; 32]);
+
+        payroll_client.begin_batch_execution_checkpoint(
+            &admin,
+            &employer,
+            &batch_root,
+            &asset,
+            &execution_nonce,
+            &2u32,
+        );
+        payroll_client.record_batch_checkpoint_progress(
+            &admin,
+            &employer,
+            &batch_root,
+            &asset,
+            &execution_nonce,
+            &1u32,
+            &BatchCheckpointState::PartiallyCheckpointed,
+        );
     }
 
     #[test]
