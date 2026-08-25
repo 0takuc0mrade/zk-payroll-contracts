@@ -743,3 +743,62 @@ pub fn emit_quorum_consumed(e: &Env, batch_root: BytesN<32>, employer: Address, 
         (batch_root, employer, nonce),
     );
 }
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Compliance Hold Events (#333)
+// ═════════════════════════════════════════════════════════════════════════════
+
+/// Emitted when a compliance hold is placed on a batch, employee group, or employer (#333).
+pub fn emit_compliance_hold_placed(
+    e: &Env,
+    hold_id: u64,
+    scope: Symbol,
+    target: Address,
+    reason_code: Symbol,
+    placed_by: Address,
+) {
+    e.events().publish(
+        (payroll_topic(), Symbol::new(e, "hold_placed")),
+        (hold_id, scope, target, reason_code, placed_by),
+    );
+}
+
+/// Emitted when a compliance hold is released (#333).
+pub fn emit_compliance_hold_released(e: &Env, hold_id: u64, released_by: Address) {
+    e.events().publish(
+        (payroll_topic(), Symbol::new(e, "hold_released")),
+        (hold_id, released_by),
+    );
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Funding Reservation Expiry Events (#337)
+// ═════════════════════════════════════════════════════════════════════════════
+
+/// Emitted when a funding reservation expires (#337).
+pub fn emit_reservation_expired(e: &Env, asset: Address, amount: i128, expired_at: u64) {
+    e.events().publish(
+        (payroll_topic(), Symbol::new(e, "reservation_expired")),
+        (asset, amount, expired_at),
+    );
+}
+
+/// Emitted when an expired reservation is released and funds become available (#337).
+pub fn emit_reservation_expiry_released(e: &Env, asset: Address, released_amount: i128) {
+    e.events().publish(
+        (payroll_topic(), Symbol::new(e, "reservation_released")),
+        (asset, released_amount),
+    );
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Payroll Archival Events (#335)
+// ═════════════════════════════════════════════════════════════════════════════
+
+/// Emitted when a payroll run is archived for long-term reporting (#335).
+pub fn emit_payroll_run_archived(e: &Env, run_id: u64, archived_by: Address, archive_reason: Symbol) {
+    e.events().publish(
+        (payroll_topic(), Symbol::new(e, "run_archived")),
+        (run_id, archived_by, archive_reason),
+    );
+}
