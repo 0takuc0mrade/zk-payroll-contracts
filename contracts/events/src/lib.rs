@@ -159,7 +159,13 @@ pub fn emit_batch_checkpoint_started(
 ) {
     e.events().publish(
         (payroll_topic(), Symbol::new(e, "batch_checkpoint_started")),
-        (employer, batch_root, asset, execution_nonce, checkpoint_index),
+        (
+            employer,
+            batch_root,
+            asset,
+            execution_nonce,
+            checkpoint_index,
+        ),
     );
 }
 
@@ -175,7 +181,14 @@ pub fn emit_batch_checkpoint_updated(
 ) {
     e.events().publish(
         (payroll_topic(), Symbol::new(e, "batch_checkpoint_updated")),
-        (employer, batch_root, asset, execution_nonce, checkpoint_index, state),
+        (
+            employer,
+            batch_root,
+            asset,
+            execution_nonce,
+            checkpoint_index,
+            state,
+        ),
     );
 }
 
@@ -190,7 +203,13 @@ pub fn emit_batch_checkpoint_resumed(
 ) {
     e.events().publish(
         (payroll_topic(), Symbol::new(e, "batch_checkpoint_resumed")),
-        (employer, batch_root, asset, execution_nonce, checkpoint_index),
+        (
+            employer,
+            batch_root,
+            asset,
+            execution_nonce,
+            checkpoint_index,
+        ),
     );
 }
 
@@ -777,7 +796,10 @@ pub fn emit_audit_pause_manager_set(e: &Env, pause_manager: Address) {
 /// Emitted when locked payroll funds are updated (#343).
 pub fn emit_locked_funds_updated(e: &Env, asset: Address, locked_amount: i128) {
     e.events().publish(
-        (Symbol::new(e, "treasury"), Symbol::new(e, "locked_funds_updated")),
+        (
+            Symbol::new(e, "treasury"),
+            Symbol::new(e, "locked_funds_updated"),
+        ),
         (asset, locked_amount),
     );
 }
@@ -842,7 +864,12 @@ pub fn emit_reservation_expiry_released(e: &Env, asset: Address, released_amount
 // ═════════════════════════════════════════════════════════════════════════════
 
 /// Emitted when a payroll run is archived for long-term reporting (#335).
-pub fn emit_payroll_run_archived(e: &Env, run_id: u64, archived_by: Address, archive_reason: Symbol) {
+pub fn emit_payroll_run_archived(
+    e: &Env,
+    run_id: u64,
+    archived_by: Address,
+    archive_reason: Symbol,
+) {
     e.events().publish(
         (payroll_topic(), Symbol::new(e, "run_archived")),
         (run_id, archived_by, archive_reason),

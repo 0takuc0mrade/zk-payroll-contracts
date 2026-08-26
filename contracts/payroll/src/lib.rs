@@ -1,9 +1,9 @@
 #![no_std]
+use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, token as soroban_token, Address, BytesN,
     Env, Symbol, Vec,
 };
-use soroban_sdk::xdr::ToXdr;
 
 use pause_manager::PauseManagerClient;
 use proof_verifier::ProofVerifierClient;
@@ -882,6 +882,7 @@ impl Payroll {
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn record_batch_checkpoint_progress(
         e: Env,
         admin: Address,
@@ -925,7 +926,10 @@ impl Payroll {
         if checkpoint.completed
             || checkpoint.failed
             || checkpoint_index < checkpoint.last_checkpoint_index
-            || matches!(state, BatchCheckpointState::Started | BatchCheckpointState::Resumed)
+            || matches!(
+                state,
+                BatchCheckpointState::Started | BatchCheckpointState::Resumed
+            )
         {
             panic!("ERR_BATCH_CHECKPOINT_MISMATCH");
         }
@@ -958,12 +962,7 @@ impl Payroll {
         asset: Address,
         execution_nonce: BytesN<32>,
     ) -> BatchCheckpoint {
-        let key = DataKey::BatchCheckpoint(
-            employer,
-            batch_root,
-            asset,
-            execution_nonce,
-        );
+        let key = DataKey::BatchCheckpoint(employer, batch_root, asset, execution_nonce);
         e.storage()
             .persistent()
             .get(&key)
@@ -2371,7 +2370,9 @@ impl Payroll {
 
     /// Check if a quorum approval payload hash has already been consumed.
     pub fn is_quorum_consumed(e: Env, quorum_hash: BytesN<32>) -> bool {
-        e.storage().persistent().has(&DataKey::ConsumedQuorum(quorum_hash))
+        e.storage()
+            .persistent()
+            .has(&DataKey::ConsumedQuorum(quorum_hash))
     }
 
     /// Verify signer quorum requirements and consume the quorum approval reference once.
@@ -2408,11 +2409,17 @@ impl Payroll {
             panic!("Quorum approval payload already consumed: replay rejected");
         }
 
-        e.storage()
-            .persistent()
-            .set(&DataKey::ConsumedQuorum(q_hash.clone()), &e.ledger().timestamp());
+        e.storage().persistent().set(
+            &DataKey::ConsumedQuorum(q_hash.clone()),
+            &e.ledger().timestamp(),
+        );
 
-        payroll_events::emit_quorum_consumed(&e, payload.batch_root, payload.employer, payload.nonce);
+        payroll_events::emit_quorum_consumed(
+            &e,
+            payload.batch_root,
+            payload.employer,
+            payload.nonce,
+        );
         q_hash
     }
 
@@ -2717,7 +2724,8 @@ impl Payroll {
             .storage()
             .persistent()
             .get(&hold_counter_key)
-            .unwrap_or(0u64) + 1;
+            .unwrap_or(0u64)
+            + 1;
 
         let now = e.ledger().timestamp();
         let hold = ComplianceHold {
@@ -2738,11 +2746,14 @@ impl Payroll {
         payroll_events::emit_compliance_hold_placed(
             &e,
             hold_id,
-            Symbol::new(&e, match scope {
-                ComplianceHoldScope::Batch => "batch",
-                ComplianceHoldScope::Employee => "employee",
-                ComplianceHoldScope::Employer => "employer",
-            }),
+            Symbol::new(
+                &e,
+                match scope {
+                    ComplianceHoldScope::Batch => "batch",
+                    ComplianceHoldScope::Employee => "employee",
+                    ComplianceHoldScope::Employer => "employer",
+                },
+            ),
             target,
             reason_code,
             admin,
@@ -2763,11 +2774,7 @@ impl Payroll {
         admin.require_auth();
 
         let key = DataKey::ComplianceHold(hold_id);
-        let mut hold: ComplianceHold = e
-            .storage()
-            .persistent()
-            .get(&key)
-            .expect("Hold not found");
+        let mut hold: ComplianceHold = e.storage().persistent().get(&key).expect("Hold not found");
 
         if !hold.is_active {
             panic!("Hold is not active");
@@ -2893,8 +2900,7 @@ impl Payroll {
             .expect("Payroll run not found");
 
         // Check if already archived
-        if e
-            .storage()
+        if e.storage()
             .persistent()
             .has(&DataKey::ArchiveMarker(run_id))
         {
@@ -5458,6 +5464,8 @@ mod tests {
             &execution_nonce,
             &7u32,
         );
+    }
+
     // ============================================================================
     // Issue #339: Admin Handover Safety Checks Tests
     // ============================================================================
@@ -5606,7 +5614,9 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "Insufficient available treasury balance: funds locked for pending payroll")]
+    #[should_panic(
+        expected = "Insufficient available treasury balance: funds locked for pending payroll"
+    )]
     fn test_withdrawal_guardrails_rejects_underfunding() {
         let env = Env::default();
         let (payroll_client, _admin, treasury, treasury_owner, employee, token_id) =
@@ -5709,7 +5719,7 @@ mod tests {
 
         // Batch domain: store as a batch root reference
         let batch_nonce = test_nonce(&env, 100);
-        payroll_client.commit_draft(&test_hash);
+        payroll_client.commit_draft(&admin, &test_hash);
 
         // Verify that the digest is stored and accessible
         // A different domain (e.g., audit) should not collide with batch domain
@@ -5730,7 +5740,7 @@ mod tests {
     #[test]
     fn test_domain_separation_treasury_vs_proof() {
         let env = Env::default();
-        let (payroll_client, admin, treasury, _treasury_owner, employee, token_id) =
+        let (payroll_client, admin, treasury, _treasury_owner, employee, _token_id) =
             setup_payroll_with_token(&env);
 
         // Test that treasury reservation nonce and proof nonce don't collide
@@ -5754,18 +5764,16 @@ mod tests {
 
         // Treasury nonce should be consumable separately
         let deposit_nonce = treasury_nonce;
-        payroll_client.deposit(&treasury, &token_id, &1000, &deposit_nonce);
+        payroll_client.deposit(&treasury, &1000, &deposit_nonce);
 
-        // Verify both nonces are tracked independently
-        assert!(!payroll_client.is_run_nonce_used(&proof_nonce));
         // After finalization, proof nonce should be consumed
-        payroll_client.finalize_payroll_run(&admin, &run_id, &[&employee].into());
+        payroll_client.finalize_payroll_run(&admin, &run_id);
     }
 
     #[test]
     fn test_overlapping_raw_inputs_different_domains() {
         let env = Env::default();
-        let (payroll_client, admin, treasury, _treasury_owner, employee, token_id) =
+        let (payroll_client, admin, _treasury, _treasury_owner, employee, _token_id) =
             setup_payroll_with_token(&env);
 
         // Create identical 32-byte patterns that should belong to different domains
@@ -5775,18 +5783,12 @@ mod tests {
 
         // Use same raw input in different domains
         // Domain 1: Draft commitment (batch domain)
-        payroll_client.commit_draft(&input1);
+        payroll_client.commit_draft(&admin, &input1);
 
         // Domain 2: Run nonce (proof domain)
         let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
-        let _run_id = payroll_client.prepare_payroll_run(
-            &proofs,
-            &amounts,
-            &employees,
-            &1000,
-            &input2,
-            &None,
-        );
+        let _run_id = payroll_client
+            .prepare_payroll_run(&proofs, &amounts, &employees, &1000, &input2, &None);
 
         // Even with identical raw bytes, domain separation ensures they're treated as different
         // (verified by successful execution without collision errors)
@@ -5918,10 +5920,7 @@ mod tests {
 
         // Set reservation expiry policy
         payroll_client.set_reservation_expiry_policy(
-            &admin,
-            &token_id,
-            &5000i128,
-            &86400u64, // 1 day expiry
+            &admin, &token_id, &5000i128, &86400u64, // 1 day expiry
         );
 
         // Verify policy was set
@@ -5941,10 +5940,7 @@ mod tests {
 
         // Set reservation with future expiry
         payroll_client.set_reservation_expiry_policy(
-            &admin,
-            &token_id,
-            &5000i128,
-            &86400u64, // Future expiry
+            &admin, &token_id, &5000i128, &86400u64, // Future expiry
         );
 
         // Attempt to release should panic since it hasn't expired
@@ -5973,7 +5969,7 @@ mod tests {
         );
 
         // Finalize the run
-        payroll_client.finalize_payroll_run(&admin, &run_id, &employees);
+        payroll_client.finalize_payroll_run(&admin, &run_id);
 
         // Verify run is not archived initially
         assert!(!payroll_client.is_payroll_run_archived(&run_id));
@@ -6014,7 +6010,7 @@ mod tests {
             &None,
         );
 
-        payroll_client.finalize_payroll_run(&admin, &run_id, &employees);
+        payroll_client.finalize_payroll_run(&admin, &run_id);
 
         // Archive once
         payroll_client.archive_payroll_run_with_reason(
@@ -6049,7 +6045,7 @@ mod tests {
                 &None,
             );
 
-            payroll_client.finalize_payroll_run(&admin, &run_id, &employees);
+            payroll_client.finalize_payroll_run(&admin, &run_id);
             payroll_client.archive_payroll_run_with_reason(
                 &admin,
                 &run_id,
