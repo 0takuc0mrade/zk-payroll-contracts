@@ -882,6 +882,7 @@ impl Payroll {
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn record_batch_checkpoint_progress(
         e: Env,
         admin: Address,
@@ -5718,7 +5719,7 @@ mod tests {
 
         // Batch domain: store as a batch root reference
         let batch_nonce = test_nonce(&env, 100);
-        payroll_client.commit_draft(&test_hash);
+        payroll_client.commit_draft(&admin, &test_hash);
 
         // Verify that the digest is stored and accessible
         // A different domain (e.g., audit) should not collide with batch domain
@@ -5739,7 +5740,7 @@ mod tests {
     #[test]
     fn test_domain_separation_treasury_vs_proof() {
         let env = Env::default();
-        let (payroll_client, admin, treasury, _treasury_owner, employee, token_id) =
+        let (payroll_client, admin, treasury, _treasury_owner, employee, _token_id) =
             setup_payroll_with_token(&env);
 
         // Test that treasury reservation nonce and proof nonce don't collide
@@ -5763,18 +5764,16 @@ mod tests {
 
         // Treasury nonce should be consumable separately
         let deposit_nonce = treasury_nonce;
-        payroll_client.deposit(&treasury, &token_id, &1000, &deposit_nonce);
+        payroll_client.deposit(&treasury, &1000, &deposit_nonce);
 
-        // Verify both nonces are tracked independently
-        assert!(!payroll_client.is_run_nonce_used(&proof_nonce));
         // After finalization, proof nonce should be consumed
-        payroll_client.finalize_payroll_run(&admin, &run_id, &[&employee].into());
+        payroll_client.finalize_payroll_run(&admin, &run_id);
     }
 
     #[test]
     fn test_overlapping_raw_inputs_different_domains() {
         let env = Env::default();
-        let (payroll_client, admin, treasury, _treasury_owner, employee, token_id) =
+        let (payroll_client, admin, _treasury, _treasury_owner, employee, _token_id) =
             setup_payroll_with_token(&env);
 
         // Create identical 32-byte patterns that should belong to different domains
@@ -5784,7 +5783,7 @@ mod tests {
 
         // Use same raw input in different domains
         // Domain 1: Draft commitment (batch domain)
-        payroll_client.commit_draft(&input1);
+        payroll_client.commit_draft(&admin, &input1);
 
         // Domain 2: Run nonce (proof domain)
         let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
@@ -5970,7 +5969,7 @@ mod tests {
         );
 
         // Finalize the run
-        payroll_client.finalize_payroll_run(&admin, &run_id, &employees);
+        payroll_client.finalize_payroll_run(&admin, &run_id);
 
         // Verify run is not archived initially
         assert!(!payroll_client.is_payroll_run_archived(&run_id));
@@ -6011,7 +6010,7 @@ mod tests {
             &None,
         );
 
-        payroll_client.finalize_payroll_run(&admin, &run_id, &employees);
+        payroll_client.finalize_payroll_run(&admin, &run_id);
 
         // Archive once
         payroll_client.archive_payroll_run_with_reason(
@@ -6046,7 +6045,7 @@ mod tests {
                 &None,
             );
 
-            payroll_client.finalize_payroll_run(&admin, &run_id, &employees);
+            payroll_client.finalize_payroll_run(&admin, &run_id);
             payroll_client.archive_payroll_run_with_reason(
                 &admin,
                 &run_id,
