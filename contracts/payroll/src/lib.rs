@@ -1,9 +1,9 @@
 #![no_std]
+use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, token as soroban_token, Address, BytesN,
     Env, Symbol, Vec,
 };
-use soroban_sdk::xdr::ToXdr;
 
 use pause_manager::PauseManagerClient;
 use proof_verifier::ProofVerifierClient;
@@ -594,6 +594,7 @@ pub struct ComplianceEvidencePointer {
     pub metadata_hash: BytesN<32>,
 }
 
+#[allow(clippy::too_many_arguments)]
 #[contractimpl]
 impl Payroll {
     pub fn initialize(
@@ -749,7 +750,7 @@ impl Payroll {
     /// - If the nonce is stale (less than or equal to the last accepted nonce)
     fn validate_nonce_monotonicity(env: &Env, employer: &Address, nonce: &BytesN<32>) {
         let sequence_key = DataKey::EmployerNonceSequence(employer.clone());
-        
+
         if let Some(sequence_state) = env
             .storage()
             .persistent()
@@ -759,12 +760,12 @@ impl Payroll {
             if nonce == &sequence_state.last_nonce {
                 panic!("Nonce replay detected: this nonce has already been used for this employer");
             }
-            
+
             // Compare nonce values to ensure monotonic increase
             // We treat the nonce as a u256 for comparison purposes
             let new_nonce_value = Self::nonce_to_u256(env, nonce);
             let last_nonce_value = Self::nonce_to_u256(env, &sequence_state.last_nonce);
-            
+
             if new_nonce_value <= last_nonce_value {
                 panic!("Stale nonce detected: nonce must be strictly greater than the last accepted nonce for this employer");
             }
@@ -783,11 +784,11 @@ impl Payroll {
     /// - `nonce`: The nonce that was just accepted
     fn update_nonce_sequence(env: &Env, employer: &Address, nonce: &BytesN<32>) {
         let sequence_key = DataKey::EmployerNonceSequence(employer.clone());
-        
-        let new_state = if let Some(mut existing_state) = env
-            .storage()
-            .persistent()
-            .get::<_, EmployerNonceSequenceState>(&sequence_key)
+
+        let new_state = if let Some(mut existing_state) =
+            env.storage()
+                .persistent()
+                .get::<_, EmployerNonceSequenceState>(&sequence_key)
         {
             existing_state.current_sequence += 1;
             existing_state.last_accepted_at = env.ledger().timestamp();
@@ -801,10 +802,8 @@ impl Payroll {
                 last_nonce: nonce.clone(),
             }
         };
-        
-        env.storage()
-            .persistent()
-            .set(&sequence_key, &new_state);
+
+        env.storage().persistent().set(&sequence_key, &new_state);
     }
 
     /// Convert a 32-byte nonce to a u256 value for comparison (#362).
@@ -813,12 +812,12 @@ impl Payroll {
     /// monotonicity comparison. The conversion treats the nonce as a
     /// big-endian unsigned integer.
     fn nonce_to_u256(_env: &Env, nonce: &BytesN<32>) -> u128 {
-        // For simplicity, we'll use the first 16 bytes as a u128 for comparison
-        // This provides sufficient uniqueness for monotonicity enforcement
+        // For simplicity, we'll use the first 16 bytes as a u128 for comparison.
+        // This provides sufficient uniqueness for monotonicity enforcement.
         let bytes = nonce.to_array();
         let mut value: u128 = 0;
-        for i in 0..16 {
-            value = (value << 8) | (bytes[i] as u128);
+        for byte in bytes.iter().take(16) {
+            value = (value << 8) | u128::from(*byte);
         }
         value
     }
@@ -827,7 +826,10 @@ impl Payroll {
     ///
     /// Returns the current nonce sequence tracking information for the specified
     /// employer, or None if no payroll runs have been processed for this employer.
-    pub fn get_employer_nonce_sequence(e: Env, employer: Address) -> Option<EmployerNonceSequenceState> {
+    pub fn get_employer_nonce_sequence(
+        e: Env,
+        employer: Address,
+    ) -> Option<EmployerNonceSequenceState> {
         e.storage()
             .persistent()
             .get(&DataKey::EmployerNonceSequence(employer))
@@ -903,9 +905,7 @@ impl Payroll {
         };
 
         // Store the pointer
-        e.storage()
-            .persistent()
-            .set(&pointer_key, &pointer);
+        e.storage().persistent().set(&pointer_key, &pointer);
 
         // Store the deduplication index
         e.storage()
@@ -914,8 +914,17 @@ impl Payroll {
 
         // Emit event for audit trail
         e.events().publish(
-            (symbol_short!("payroll"), Symbol::new(&e, "evidence_pointer_created")),
-            (pointer_id.clone(), content_hash, scope as u32, target, admin),
+            (
+                symbol_short!("payroll"),
+                Symbol::new(&e, "evidence_pointer_created"),
+            ),
+            (
+                pointer_id.clone(),
+                content_hash,
+                scope as u32,
+                target,
+                admin,
+            ),
         );
 
         pointer_id
@@ -1028,7 +1037,9 @@ impl Payroll {
         admin.require_auth();
 
         // Validate version is within supported range
-        if version < Self::MIN_SUPPORTED_STORAGE_VERSION || version > Self::MAX_SUPPORTED_STORAGE_VERSION {
+        if version < Self::MIN_SUPPORTED_STORAGE_VERSION
+            || version > Self::MAX_SUPPORTED_STORAGE_VERSION
+        {
             panic!("Storage version out of supported range");
         }
 
@@ -1057,7 +1068,10 @@ impl Payroll {
 
         // Emit event for audit trail
         e.events().publish(
-            (symbol_short!("payroll"), Symbol::new(&e, "storage_version_set")),
+            (
+                symbol_short!("payroll"),
+                Symbol::new(&e, "storage_version_set"),
+            ),
             (version, admin),
         );
     }
@@ -1067,9 +1081,7 @@ impl Payroll {
     /// Returns the current storage version state, or None if not initialized.
     /// Clients can use this to detect if migration is required.
     pub fn get_storage_version(e: Env) -> Option<StorageVersionState> {
-        e.storage()
-            .persistent()
-            .get(&DataKey::StorageVersion)
+        e.storage().persistent().get(&DataKey::StorageVersion)
     }
 
     /// Check if the current storage version is supported (#360).
@@ -1118,10 +1130,8 @@ impl Payroll {
     /// - If migration is required but not complete
     /// - If the contract is in a partially migrated state
     fn validate_storage_version_for_operation(e: &Env, operation_name: &str) {
-        let version_state: Option<StorageVersionState> = e
-            .storage()
-            .persistent()
-            .get(&DataKey::StorageVersion);
+        let version_state: Option<StorageVersionState> =
+            e.storage().persistent().get(&DataKey::StorageVersion);
 
         match version_state {
             Some(state) => {
@@ -1159,10 +1169,8 @@ impl Payroll {
     /// if the contract is ready for operations. This is a read-only function
     /// that does not modify state.
     pub fn check_migration_readiness(e: Env) -> MigrationReadinessState {
-        let version_state: Option<StorageVersionState> = e
-            .storage()
-            .persistent()
-            .get(&DataKey::StorageVersion);
+        let version_state: Option<StorageVersionState> =
+            e.storage().persistent().get(&DataKey::StorageVersion);
 
         match version_state {
             Some(state) => MigrationReadinessState {
@@ -1518,6 +1526,7 @@ impl Payroll {
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn record_batch_checkpoint_progress(
         e: Env,
         admin: Address,
@@ -1561,7 +1570,10 @@ impl Payroll {
         if checkpoint.completed
             || checkpoint.failed
             || checkpoint_index < checkpoint.last_checkpoint_index
-            || matches!(state, BatchCheckpointState::Started | BatchCheckpointState::Resumed)
+            || matches!(
+                state,
+                BatchCheckpointState::Started | BatchCheckpointState::Resumed
+            )
         {
             panic!("ERR_BATCH_CHECKPOINT_MISMATCH");
         }
@@ -1594,12 +1606,7 @@ impl Payroll {
         asset: Address,
         execution_nonce: BytesN<32>,
     ) -> BatchCheckpoint {
-        let key = DataKey::BatchCheckpoint(
-            employer,
-            batch_root,
-            asset,
-            execution_nonce,
-        );
+        let key = DataKey::BatchCheckpoint(employer, batch_root, asset, execution_nonce);
         e.storage()
             .persistent()
             .get(&key)
@@ -3031,7 +3038,9 @@ impl Payroll {
 
     /// Check if a quorum approval payload hash has already been consumed.
     pub fn is_quorum_consumed(e: Env, quorum_hash: BytesN<32>) -> bool {
-        e.storage().persistent().has(&DataKey::ConsumedQuorum(quorum_hash))
+        e.storage()
+            .persistent()
+            .has(&DataKey::ConsumedQuorum(quorum_hash))
     }
 
     /// Verify signer quorum requirements and consume the quorum approval reference once.
@@ -3068,11 +3077,17 @@ impl Payroll {
             panic!("Quorum approval payload already consumed: replay rejected");
         }
 
-        e.storage()
-            .persistent()
-            .set(&DataKey::ConsumedQuorum(q_hash.clone()), &e.ledger().timestamp());
+        e.storage().persistent().set(
+            &DataKey::ConsumedQuorum(q_hash.clone()),
+            &e.ledger().timestamp(),
+        );
 
-        payroll_events::emit_quorum_consumed(&e, payload.batch_root, payload.employer, payload.nonce);
+        payroll_events::emit_quorum_consumed(
+            &e,
+            payload.batch_root,
+            payload.employer,
+            payload.nonce,
+        );
         q_hash
     }
 
@@ -3377,7 +3392,8 @@ impl Payroll {
             .storage()
             .persistent()
             .get(&hold_counter_key)
-            .unwrap_or(0u64) + 1;
+            .unwrap_or(0u64)
+            + 1;
 
         let now = e.ledger().timestamp();
         let hold = ComplianceHold {
@@ -3398,11 +3414,14 @@ impl Payroll {
         payroll_events::emit_compliance_hold_placed(
             &e,
             hold_id,
-            Symbol::new(&e, match scope {
-                ComplianceHoldScope::Batch => "batch",
-                ComplianceHoldScope::Employee => "employee",
-                ComplianceHoldScope::Employer => "employer",
-            }),
+            Symbol::new(
+                &e,
+                match scope {
+                    ComplianceHoldScope::Batch => "batch",
+                    ComplianceHoldScope::Employee => "employee",
+                    ComplianceHoldScope::Employer => "employer",
+                },
+            ),
             target,
             reason_code,
             admin,
@@ -3423,11 +3442,7 @@ impl Payroll {
         admin.require_auth();
 
         let key = DataKey::ComplianceHold(hold_id);
-        let mut hold: ComplianceHold = e
-            .storage()
-            .persistent()
-            .get(&key)
-            .expect("Hold not found");
+        let mut hold: ComplianceHold = e.storage().persistent().get(&key).expect("Hold not found");
 
         if !hold.is_active {
             panic!("Hold is not active");
@@ -3553,8 +3568,7 @@ impl Payroll {
             .expect("Payroll run not found");
 
         // Check if already archived
-        if e
-            .storage()
+        if e.storage()
             .persistent()
             .has(&DataKey::ArchiveMarker(run_id))
         {
@@ -6268,7 +6282,9 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "Insufficient available treasury balance: funds locked for pending payroll")]
+    #[should_panic(
+        expected = "Insufficient available treasury balance: funds locked for pending payroll"
+    )]
     fn test_withdrawal_guardrails_rejects_underfunding() {
         let env = Env::default();
         let (payroll_client, _admin, treasury, treasury_owner, employee, token_id) =
@@ -6392,7 +6408,7 @@ mod tests {
     #[test]
     fn test_domain_separation_treasury_vs_proof() {
         let env = Env::default();
-        let (payroll_client, admin, treasury, _treasury_owner, employee, token_id) =
+        let (payroll_client, admin, treasury, _treasury_owner, employee, _token_id) =
             setup_payroll_with_token(&env);
 
         // Test that treasury reservation nonce and proof nonce don't collide
@@ -6426,7 +6442,7 @@ mod tests {
     #[test]
     fn test_overlapping_raw_inputs_different_domains() {
         let env = Env::default();
-        let (payroll_client, admin, treasury, _treasury_owner, employee, token_id) =
+        let (payroll_client, admin, _treasury, _treasury_owner, employee, _token_id) =
             setup_payroll_with_token(&env);
 
         // Create identical 32-byte patterns that should belong to different domains
@@ -6440,14 +6456,8 @@ mod tests {
 
         // Domain 2: Run nonce (proof domain)
         let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
-        let _run_id = payroll_client.prepare_payroll_run(
-            &proofs,
-            &amounts,
-            &employees,
-            &1000,
-            &input2,
-            &None,
-        );
+        let _run_id = payroll_client
+            .prepare_payroll_run(&proofs, &amounts, &employees, &1000, &input2, &None);
 
         // Even with identical raw bytes, domain separation ensures they're treated as different
         // (verified by successful execution without collision errors)
@@ -6579,10 +6589,7 @@ mod tests {
 
         // Set reservation expiry policy
         payroll_client.set_reservation_expiry_policy(
-            &admin,
-            &token_id,
-            &5000i128,
-            &86400u64, // 1 day expiry
+            &admin, &token_id, &5000i128, &86400u64, // 1 day expiry
         );
 
         // Verify policy was set
@@ -6602,10 +6609,7 @@ mod tests {
 
         // Set reservation with future expiry
         payroll_client.set_reservation_expiry_policy(
-            &admin,
-            &token_id,
-            &5000i128,
-            &86400u64, // Future expiry
+            &admin, &token_id, &5000i128, &86400u64, // Future expiry
         );
 
         // Attempt to release should panic since it hasn't expired
@@ -6758,7 +6762,14 @@ mod tests {
         // First nonce should be accepted
         let nonce = test_nonce(&env, 10);
         let (proofs1, amounts1, employees1) = single_payment_batch(&env, &employee, 1000);
-        payroll_client.batch_process_payroll(&proofs1, &amounts1, &employees1, &1000, &nonce, &None);
+        payroll_client.batch_process_payroll(
+            &proofs1,
+            &amounts1,
+            &employees1,
+            &1000,
+            &nonce,
+            &None,
+        );
 
         // Second call with the same nonce must fail (replay attack)
         let (proofs2, amounts2, employees2) = single_payment_batch(&env, &employee, 1000);
@@ -6782,7 +6793,14 @@ mod tests {
         // First nonce (higher value) should be accepted
         let nonce1 = test_nonce(&env, 20);
         let (proofs1, amounts1, employees1) = single_payment_batch(&env, &employee, 1000);
-        payroll_client.batch_process_payroll(&proofs1, &amounts1, &employees1, &1000, &nonce1, &None);
+        payroll_client.batch_process_payroll(
+            &proofs1,
+            &amounts1,
+            &employees1,
+            &1000,
+            &nonce1,
+            &None,
+        );
 
         // Second nonce (lower value - stale) must fail
         let nonce2 = test_nonce(&env, 10);
@@ -6966,7 +6984,7 @@ mod tests {
         // Storage version should be initialized
         let version = payroll_client.get_storage_version();
         assert!(version.is_some());
-        
+
         let version_state = version.unwrap();
         assert_eq!(version_state.version, 1); // CURRENT_STORAGE_VERSION
         assert!(version_state.migration_complete);
