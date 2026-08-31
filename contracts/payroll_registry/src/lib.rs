@@ -21,15 +21,15 @@ pub struct CompanyInfo {
     pub treasury: Address,
 }
 
-// ── Issue #90: employee eligibility ──────────────────────────────────────────
+// ?? Issue #90: employee eligibility ??????????????????????????????????????????
 
 /// Registration state for an employee.
 ///
 /// Eligibility checks use this to decide whether an employee can be included
 /// in a payroll execution:
-///   - `Active`     → eligible; commitment is registered and record is complete.
-///   - `Inactive`   → temporarily ineligible (e.g. on leave, terminated).
-///   - `Incomplete` → missing required registration data; never eligible until
+///   - `Active`     ? eligible; commitment is registered and record is complete.
+///   - `Inactive`   ? temporarily ineligible (e.g. on leave, terminated).
+///   - `Incomplete` ? missing required registration data; never eligible until
 ///                    the record is corrected and marked `Active`.
 #[contracttype]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -40,7 +40,7 @@ pub enum EmployeeStatus {
     Incomplete = 2,
 }
 
-// ── Issue #91: privileged-role rotation ──────────────────────────────────────
+// ?? Issue #91: privileged-role rotation ??????????????????????????????????????
 
 /// Pending two-step company admin or treasury rotation.
 ///
@@ -56,12 +56,12 @@ pub struct PendingCompanyRotation {
 
 /// Storage key space for the payroll registry.
 ///
-/// - `Company(u64)`               → `CompanyInfo`              (Persistent)
-/// - `Employee(u64, Address)`     → `BytesN<32>`               (Persistent, commitment)
-/// - `EmpStatus(u64, Address)`    → `EmployeeStatus`           (Persistent, eligibility)
-/// - `CompanySequence`            → `u64`                      (Persistent, counter)
-/// - `PendingAdminRotation(u64)`  → `PendingCompanyRotation`   (Persistent, issue #91)
-/// - `PendingTreasuryRotation(u64)` → `PendingCompanyRotation` (Persistent, issue #91)
+/// - `Company(u64)`               ? `CompanyInfo`              (Persistent)
+/// - `Employee(u64, Address)`     ? `BytesN<32>`               (Persistent, commitment)
+/// - `EmpStatus(u64, Address)`    ? `EmployeeStatus`           (Persistent, eligibility)
+/// - `CompanySequence`            ? `u64`                      (Persistent, counter)
+/// - `PendingAdminRotation(u64)`  ? `PendingCompanyRotation`   (Persistent, issue #91)
+/// - `PendingTreasuryRotation(u64)` ? `PendingCompanyRotation` (Persistent, issue #91)
 #[contracttype]
 pub enum DataKey {
     Company(u64),
@@ -80,7 +80,7 @@ pub enum DataKey {
 }
 
 // ---------------------------------------------------------------------------
-// Trait — canonical interface specification for #12
+// Trait ? canonical interface specification for #12
 // ---------------------------------------------------------------------------
 
 pub trait PayrollRegistryTrait {
@@ -119,7 +119,7 @@ pub trait PayrollRegistryTrait {
     /// Read an employee's active commitment under a company.
     fn get_commitment(env: Env, company_id: u64, employee: Address) -> BytesN<32>;
 
-    // ── Issue #90: employee eligibility ──────────────────────────────────────
+    // ?? Issue #90: employee eligibility ??????????????????????????????????????
 
     /// Set the eligibility status for a registered employee.
     /// Requires authorisation from the company admin.
@@ -132,7 +132,10 @@ pub trait PayrollRegistryTrait {
     /// Return `true` iff the employee is registered AND has `Active` status.
     fn is_eligible(env: Env, company_id: u64, employee: Address) -> bool;
 
-    // ── Issue #91: company-level admin/treasury rotation ─────────────────────
+    /// Read-only helper for clients that only need active/inactive state.
+    fn is_employee_active(env: Env, company_id: u64, employee: Address) -> bool;
+
+    // ?? Issue #91: company-level admin/treasury rotation ?????????????????????
 
     /// Propose a new company admin (step 1 of 2).
     fn propose_admin_rotation(
@@ -434,7 +437,7 @@ impl PayrollRegistryTrait for PayrollRegistry {
             .expect("Employee not found")
     }
 
-    // ── Issue #90: employee eligibility ──────────────────────────────────────
+    // ?? Issue #90: employee eligibility ??????????????????????????????????????
 
     fn set_employee_status(env: Env, company_id: u64, employee: Address, status: EmployeeStatus) {
         Self::require_not_paused(&env);
@@ -493,6 +496,10 @@ impl PayrollRegistryTrait for PayrollRegistry {
     }
 
     fn is_eligible(env: Env, company_id: u64, employee: Address) -> bool {
+        Self::is_employee_active(env, company_id, employee)
+    }
+
+    fn is_employee_active(env: Env, company_id: u64, employee: Address) -> bool {
         if !env
             .storage()
             .persistent()
@@ -508,7 +515,7 @@ impl PayrollRegistryTrait for PayrollRegistry {
         status == EmployeeStatus::Active
     }
 
-    // ── Issue #91: company-level admin/treasury rotation ─────────────────────
+    // ?? Issue #91: company-level admin/treasury rotation ?????????????????????
 
     fn propose_admin_rotation(
         env: Env,
