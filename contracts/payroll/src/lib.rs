@@ -494,6 +494,8 @@ pub enum DataKey {
     PayrollState(u64),
     /// Allowed asset token map for payroll payouts.
     AllowedAsset(Address),
+    /// Enumerable list backing the supported-assets read helper (#427).
+    SupportedAssets,
     /// Checkpointed payroll batch execution keyed by a privacy-safe tuple.
     BatchCheckpoint(Address, BytesN<32>, Address, BytesN<32>),
     /// Authorized reviewer registration for payroll run reviews.
@@ -665,6 +667,10 @@ impl Payroll {
         e.storage()
             .persistent()
             .set(&DataKey::AllowedAsset(addrs.token.clone()), &true);
+        e.storage().persistent().set(
+            &DataKey::SupportedAssets,
+            &Vec::from_array(&e, [addrs.token.clone()]),
+        );
         e.storage()
             .persistent()
             .set(&DataKey::TreasuryOwner, &treasury_owner);
@@ -772,6 +778,15 @@ impl Payroll {
                     panic!("Duplicate employee wallet in payroll batch");
                 }
             }
+        }
+    }
+
+    fn validate_batch_lengths(proof_count: u32, amount_count: u32, employee_count: u32) {
+        if proof_count < amount_count || proof_count < employee_count {
+            panic!("Missing payroll proof: one proof is required per payment");
+        }
+        if amount_count != proof_count || employee_count != proof_count {
+            panic!("Array length mismatch");
         }
     }
 
@@ -1296,7 +1311,29 @@ impl Payroll {
         addrs.admin.require_auth();
         e.storage()
             .persistent()
-            .set(&DataKey::AllowedAsset(asset), &allowed);
+            .set(&DataKey::AllowedAsset(asset.clone()), &allowed);
+
+        let mut assets: Vec<Address> =
+            if let Some(stored) = e.storage().persistent().get(&DataKey::SupportedAssets) {
+                stored
+            } else {
+                let mut existing = Vec::new(&e);
+                if Self::is_asset_allowed(e.clone(), addrs.token.clone()) {
+                    existing.push_back(addrs.token);
+                }
+                existing
+            };
+        let position = assets.first_index_of(asset.clone());
+        if allowed && position.is_none() {
+            assets.push_back(asset);
+        } else if !allowed {
+            if let Some(index) = position {
+                assets.remove(index);
+            }
+        }
+        e.storage()
+            .persistent()
+            .set(&DataKey::SupportedAssets, &assets);
     }
 
     /// Check if an asset token is allowlisted for payroll payouts.
@@ -1305,6 +1342,22 @@ impl Payroll {
             .persistent()
             .get(&DataKey::AllowedAsset(asset))
             .unwrap_or(false)
+    }
+
+    /// Return the payroll assets currently enabled for this employer contract.
+    pub fn get_supported_assets(e: Env) -> Vec<Address> {
+        if let Some(assets) = e.storage().persistent().get(&DataKey::SupportedAssets) {
+            return assets;
+        }
+
+        let addrs: Option<ContractAddresses> = e.storage().persistent().get(&DataKey::Addresses);
+        let mut assets = Vec::new(&e);
+        if let Some(addrs) = addrs {
+            if Self::is_asset_allowed(e.clone(), addrs.token.clone()) {
+                assets.push_back(addrs.token);
+            }
+        }
+        assets
     }
 
     pub fn deposit(e: Env, from: Address, amount: i128, deposit_id: BytesN<32>) {
@@ -2015,9 +2068,7 @@ impl Payroll {
 
         let count = proofs.len();
 
-        if amounts.len() != count || employees.len() != count {
-            panic!("Array length mismatch");
-        }
+        Self::validate_batch_lengths(count, amounts.len(), employees.len());
 
         if count == 0 {
             panic!("Empty payroll batch");
@@ -2274,9 +2325,7 @@ impl Payroll {
         }
         let count = proofs.len();
 
-        if amounts.len() != count || employees.len() != count {
-            panic!("Array length mismatch");
-        }
+        Self::validate_batch_lengths(count, amounts.len(), employees.len());
 
         if count == 0 {
             panic!("Empty payroll batch");
